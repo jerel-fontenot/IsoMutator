@@ -1,0 +1,46 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Project Logs
+logs/
+*.log
+
+# AI Models & Serialization
+models/
+*.pkl
+*.pickle
+
+# Databases / Sinks (For when you wire up the output)
+*.db
+*.sqlite3
+
+# System-specific / Shared Memory
+/dev/shm/*
+.env
+
+# Tooling & Linting
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local environment tools
+.direnv/
+.envrc
+.python-version
+
+# IDE / Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
