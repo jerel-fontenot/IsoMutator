@@ -1,8 +1,9 @@
 """
-isomutator Queue Manager (src/isomutator/core/queue_manager.py)
----------------------------------------------------------
-Bridges the asyncio event loop (Ingestors) with the 
-multiprocessing workers (Inference) safely and efficiently.
+ALGORITHM SUMMARY:
+The QueueManager bridges the asyncio event loops (Mutator) with the 
+multiprocessing workers (Striker, Judge) safely and efficiently.
+It provides both asynchronous and synchronous methods for pushing and pulling 
+data across OS-level process boundaries without deadlocking the CPU.
 """
 
 import asyncio
@@ -10,7 +11,6 @@ import queue
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 
-# We import the LogManager to grab our pre-configured system logger
 from isomutator.core.log_manager import LogManager
 
 
@@ -18,22 +18,19 @@ class QueueManager:
     def __init__(self, max_size: int = 10000):
         """
         Initializes the communication bridge.
-        max_size prevents RAM exhaustion if the scrapers outpace the Neural Network.
+        max_size prevents RAM exhaustion if generators outpace the workers.
         """
         self.logger = LogManager.get_logger("isomutator.system")
         
         # The underlying OS-level pipe
         self._queue = multiprocessing.Queue(maxsize=max_size)
         
-        # A dedicated thread pool just for putting items into the queue.
+        # A dedicated thread pool just for putting items into the queue asynchronously.
         # This prevents the async loop from freezing during OS-level memory locks.
         self._put_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="QueuePusher")
         
         self.logger.trace(f"QueueManager initialized with max_size={max_size}")
 
-    # ==========================================
-    # Serialization Rules (For multiprocessing "spawn")
-    # ==========================================
     def __getstate__(self):
         """
         Dictates what gets Pickled when crossing the OS process boundary.
@@ -41,8 +38,6 @@ class QueueManager:
         """
         state = self.__dict__.copy()
         
-        # The InferenceWorker only consumes data, so it doesn't need the put_executor.
-        # We safely delete it from the payload before it crosses the bridge.
         if '_put_executor' in state:
             del state['_put_executor']
             
@@ -53,22 +48,17 @@ class QueueManager:
         Rebuilds the object on the other side of the process boundary.
         """
         self.__dict__.update(state)
-        
-        # Set it to None on the worker side so we don't hit an AttributeError
-        # (even though the InferenceWorker will never call async_put anyway).
         self._put_executor = None
 
     # ==========================================
-    # Producer Side (Asyncio Web Scrapers)
+    # Asynchronous Methods (For the Mutator)
     # ==========================================
     async def async_put(self, item, timeout: float = 0.5) -> bool:
         """
         Safely puts an item into the multiprocessing queue without blocking the event loop.
-        Returns True if successful, False if the queue is full.
         """
         loop = asyncio.get_running_loop()
         
-        # We wrap the blocking queue.put call in a standard function
         def _blocking_put():
             try:
                 self._queue.put(item, block=True, timeout=timeout)
@@ -76,42 +66,49 @@ class QueueManager:
             except queue.Full:
                 return False
 
-        # We tell the async loop to run that blocking function in a background thread
         success = await loop.run_in_executor(self._put_executor, _blocking_put)
         
         if not success:
-            self.logger.warning("Queue is FULL! Scrapers are outpacing the Inference Worker. Dropping packet.")
+            self.logger.warning("Queue is FULL! Dropping packet to prevent deadlock.")
         
         return success
 
     # ==========================================
-    # Consumer Side (Multiprocessing Brain)
+    # Synchronous Methods (For the Judge & Striker)
     # ==========================================
+    def put(self, item, timeout: float = 2.0) -> bool:
+        """
+        Synchronously puts an item into the queue.
+        Used by multiprocessing workers (like the Judge) to route feedback data.
+        """
+        try:
+            self._queue.put(item, block=True, timeout=timeout)
+            return True
+        except queue.Full:
+            self.logger.warning("Queue is FULL! Failed to route packet.")
+            return False
+
     def get_batch(self, target_size: int = 32, max_wait: float = 1.0) -> list:
         """
-        Pulls a batch of items for the Neural Network. 
-        Blocks until at least ONE item is available, then sweeps the rest instantly.
+        Pulls a batch of items. Blocks until at least ONE item is available, 
+        then sweeps the rest instantly up to the target_size.
         """
         batch = []
         
         try:
-            # 1. The Blocking Wait: Wait for the first item (sleeps the CPU if empty)
+            # 1. Wait for the first item (sleeps the CPU if empty)
             first_item = self._queue.get(block=True, timeout=max_wait)
             batch.append(first_item)
             
-            # 2. The Sweep: Grab up to (target_size - 1) more items instantly
+            # 2. Sweep: Grab up to (target_size - 1) more items instantly
             while len(batch) < target_size:
                 try:
-                    # Give the OS pipe a tiny 10ms grace period to flush the next item
                     next_item = self._queue.get(block=True, timeout=0.01)
                     batch.append(next_item)
                 except queue.Empty:
-                    # Queue is empty, stop sweeping and return what we have
                     break
                     
         except queue.Empty:
-            # The max_wait timeout was hit before even a single item arrived.
-            # This is totally fine; it just means the internet is quiet right now.
             pass
             
         return batch
@@ -121,17 +118,14 @@ class QueueManager:
     # ==========================================
     def send_poison_pill(self):
         """Drops the shutdown signal into the queue."""
-        self.logger.info("Sending Poison Pill to Inference Worker...")
+        self.logger.info("Sending Poison Pill through queue...")
         try:
             self._queue.put("POISON_PILL", block=True, timeout=2.0)
         except queue.Full:
             self.logger.error("Could not send Poison Pill! Queue is deadlocked.")
 
     def get_approximate_size(self) -> int:
-        """
-        Returns the rough size of the queue. 
-        (Note: qsize() is notoriously unreliable on macOS, but works well on Fedora/Linux).
-        """
+        """Returns the rough size of the queue."""
         try:
             return self._queue.qsize()
         except NotImplementedError:
@@ -139,6 +133,7 @@ class QueueManager:
             
     def close(self):
         """Cleans up the background threads."""
-        self._put_executor.shutdown(wait=False)
+        if self._put_executor:
+            self._put_executor.shutdown(wait=False)
         self._queue.close()
         self.logger.trace("QueueManager pipes closed.")
