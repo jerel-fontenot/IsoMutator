@@ -38,7 +38,9 @@ from isomutator.core.strategies import (
     TokenObfuscationStrategy,
     ResourceExhaustionStrategy,
     OwaspXssStrategy,
-    LinuxPrivescStrategy
+    LinuxPrivescStrategy,
+    PersonaJailbreakStrategy,
+    GradientStrategy
 )
 
 # Global references for the shutdown handler
@@ -179,7 +181,9 @@ def main():
         "obfuscation": TokenObfuscationStrategy,
         "exhaustion": ResourceExhaustionStrategy,
         "owasp_xss": OwaspXssStrategy,
-        "linux_privesc": LinuxPrivescStrategy
+        "linux_privesc": LinuxPrivescStrategy,
+        "persona": PersonaJailbreakStrategy,
+        "gradient": GradientStrategy
     }
 
     # Setup the argument parser dynamically using the factory keys
