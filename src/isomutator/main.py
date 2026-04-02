@@ -29,8 +29,17 @@ from isomutator.ingestors.mutator import PromptMutator
 from isomutator.processors.striker import AsyncStriker
 from isomutator.processors.judge import RedTeamJudge
 from isomutator.ui.dashboard import DashboardManager
-from isomutator.core.strategies import JailbreakStrategy, ModelInversionStrategy
 from isomutator.reporting.reporter import VulnerabilityReporter
+from isomutator.core.strategies import (
+    JailbreakStrategy, 
+    ModelInversionStrategy,
+    PromptLeakingStrategy,
+    CrossLingualStrategy,
+    TokenObfuscationStrategy,
+    ResourceExhaustionStrategy,
+    OwaspXssStrategy,
+    LinuxPrivescStrategy
+)
 
 # Global references for the shutdown handler
 _active_queues = [] 
@@ -160,24 +169,35 @@ def main():
     Entry point for IsoMutator.
     Handles low-level OS configuration before passing control to the async boot sequence.
     """
-    # Setup the Factory argument parser
+    # 1. The Strategy Factory Dictionary
+    # This cleanly maps CLI strings to their respective strategy classes
+    strategy_factory = {
+        "jailbreak": JailbreakStrategy,
+        "inversion": ModelInversionStrategy,
+        "prompt_leaking": PromptLeakingStrategy,
+        "cross_lingual": CrossLingualStrategy,
+        "obfuscation": TokenObfuscationStrategy,
+        "exhaustion": ResourceExhaustionStrategy,
+        "owasp_xss": OwaspXssStrategy,
+        "linux_privesc": LinuxPrivescStrategy
+    }
+
+    # Setup the argument parser dynamically using the factory keys
     parser = argparse.ArgumentParser(description="IsoMutator AI Red Teaming Framework")
     parser.add_argument(
         "--mode", 
         type=str, 
-        choices=["jailbreak", "inversion", "prompt_leaking", "cross_lingual", "obfuscation", "exhaustion"], 
+        choices=list(strategy_factory.keys()), 
         default="jailbreak",
         help="Select the attack strategy to execute."
     )
     args = parser.parse_args()
 
-    # Instantiate the requested strategy
-    if args.mode == "inversion":
-        active_strategy = ModelInversionStrategy()
-    else:
-        active_strategy = JailbreakStrategy()
+    # 2. Instantiate the requested strategy using the factory
+    active_strategy = strategy_factory[args.mode]()
 
     print(f"--- Starting IsoMutator in {active_strategy.name.upper()} mode ---")
+    
     # Force "spawn" to prevent async/fork deadlocks on Linux
     multiprocessing.set_start_method("spawn", force=True)
     
