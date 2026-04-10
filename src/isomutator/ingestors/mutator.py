@@ -22,9 +22,10 @@ import aiohttp
 import json
 import logging
 import re
-from typing import List, Dict
+import llm_client
 
 from isomutator.ingestors.base import BaseSource
+from isomutator.ingestors.llm_client import AttackerLLMClient
 from isomutator.models.packet import DataPacket
 from isomutator.core.strategies import RedTeamStrategy
 
@@ -48,8 +49,8 @@ class PromptMutator(BaseSource):
         self.feedback_queue = feedback_queue
         self.strategy = strategy
         
-        self.attacker_url = "http://192.9.159.125:11434/api/chat"
-        self.attacker_model = "llama3.2" 
+        # --- OOP Dependency Injection ---
+        self.llm_client = llm_client or AttackerLLMClient()
         
         # Load the dynamic goals
         self.seed_goals = self.strategy.seed_goals.copy()
@@ -224,7 +225,7 @@ class PromptMutator(BaseSource):
             {"role": "user", "content": f"Conversation History:\n{transcript}\n\nGenerate your counter-attack."}
         ]
 
-        attack_data = await self._call_llm_with_retry(session, messages)
+        attack_data = await self.llm_client.generate_json(session, messages)
         
         # Greedy extraction fallback
         new_payload = (
@@ -259,7 +260,8 @@ class PromptMutator(BaseSource):
             {"role": "user", "content": f"Target Goal: {seed_goal}"}
         ]
 
-        parsed_data = await self._call_llm_with_retry(session, messages)
+        # --- DELEGATE TO CLIENT ---
+        parsed_data = await self.llm_client.generate_json(session, messages)
         mutations = parsed_data.get("attacks", [])
         
         for attack_data in mutations:

@@ -1,25 +1,37 @@
 """
+ALGORITHM SUMMARY:
 isomutator Configuration Manager (src/isomutator/core/config.py)
-----------------------------------------------------------
-Loads variables from .env and ensures strict typing.
+Loads variables from .env and ensures strict typing for remote AI targeting.
+
+TECHNOLOGY QUIRKS:
+- Pydantic V2 URLs: We cast the validated `AnyHttpUrl` object back to a standard string 
+  during the validation phase. This allows the rest of the codebase to treat the URL 
+  as a pure string (preventing type comparison errors) while maintaining strict schema checks.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AnyHttpUrl, TypeAdapter, field_validator
+
+_url_validator = TypeAdapter(AnyHttpUrl)
 
 class IsoConfig(BaseSettings):
-    # If these are missing from the .env, Pydantic will use these defaults
     batch_size: int = 4
     max_wait_seconds: float = 1.0
     shutdown_timeout: float = 15.0
-
-    # Storage with safe default
     db_path: str = "data/isomutator.db"
-
-    # Worker scaling
-    # 0 means auto-detect based on CPU cores
     worker_count: int = 0
 
-    # Tell Pydantic to look for variables starting with ISO_ in the .env file
+    # Remote Targeting Defaults
+    target_url: str = "http://192.9.159.125:8000"
+    attacker_url: str = "http://192.9.159.125:11434"
+
+    @field_validator('target_url', 'attacker_url')
+    @classmethod
+    def validate_and_strip_url(cls, v: str) -> str:
+        """Validates the URL schema and strips trailing slashes to prevent route doubling."""
+        valid_url = _url_validator.validate_python(v)
+        return str(valid_url).rstrip("/")
+
     model_config = SettingsConfigDict(
         env_file=".env", 
         env_file_encoding="utf-8", 
@@ -27,5 +39,5 @@ class IsoConfig(BaseSettings):
         extra="ignore"
     )
 
-# Instantiate a global singleton we can import anywhere
+# Instantiate a global singleton
 settings = IsoConfig()

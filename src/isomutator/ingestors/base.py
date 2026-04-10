@@ -7,7 +7,6 @@ DataPackets across the asynchronous boundary.
 """
 
 import abc
-import asyncio
 from isomutator.core.queue_manager import QueueManager
 from isomutator.core.log_manager import LogManager
 

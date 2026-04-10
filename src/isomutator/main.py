@@ -146,7 +146,7 @@ async def boot_sequence(strategy):
         attack_queue=_attack_queue,
         eval_queue=_eval_queue,
         log_queue=_log_manager.log_queue,
-        target_url="http://192.9.159.125:11434/api/chat" 
+        target_url=settings.target_url 
     )
     striker.start()
     _inference_workers.append(striker) 

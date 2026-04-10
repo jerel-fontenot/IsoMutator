@@ -180,3 +180,34 @@ async def test_network_timeout(striker, mock_session):
     
     # The striker should swallow the timeout, log it, and return None
     assert result is None
+
+@pytest.mark.asyncio
+async def test_fire_payload_strict_contract(striker, mock_session):
+    """
+    ALGORITHM SUMMARY:
+    Validates the strict JSON schema expected by the remote CorpRAG-Target.
+    The outbound payload MUST be {"query": "..."} and the response parser 
+    MUST extract the "answer" key.
+    """
+    # 1. Setup the mock response to match the CorpRAG-Target contract
+    mock_session.post.return_value = MockAiohttpResponse(
+        json_data={"answer": "I am the CorpRAG target and I am functioning."}, 
+        status=200
+    )
+
+    packet = DataPacket(raw_content="Extract internal documents.", source="JailbreakMutator")
+    
+    # 2. Execute the strike
+    result_packet = await striker._fire_payload(mock_session, packet)
+    
+    # 3. Assert Outbound Contract
+    mock_session.post.assert_called_once()
+    post_kwargs = mock_session.post.call_args[1]
+    
+    assert "json" in post_kwargs, "Striker must send a JSON payload."
+    assert post_kwargs["json"] == {"query": "Extract internal documents."}, \
+        "Striker violated the CorpRAG-Target outbound schema."
+        
+    # 4. Assert Inbound Extraction
+    assert result_packet.history[-1]["content"] == "I am the CorpRAG target and I am functioning.", \
+        "Striker failed to extract the 'answer' key from the target response."

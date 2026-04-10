@@ -23,11 +23,12 @@ import logging
 import os
 import re
 import uuid
-from typing import List, Dict
+import llm_client
 
 from isomutator.ingestors.base import BaseSource
 from isomutator.models.packet import DataPacket
 from isomutator.core.strategies import ContextInjectionStrategy
+from isomutator.ingestors.llm_client import AttackerLLMClient
 
 # Establish TRACE level logging if it does not exist
 TRACE_LEVEL_NUM = 5
@@ -53,8 +54,8 @@ class ContextMutator(BaseSource):
             raise TypeError("ContextMutator requires a ContextInjectionStrategy implementation.")
         self.strategy = strategy
         
-        self.attacker_url = "http://192.9.159.125:11434/api/chat"
-        self.attacker_model = "llama3.2" 
+        # --- OOP Dependency Injection ---
+        self.llm_client = llm_client or AttackerLLMClient()
         
         self.staging_dir = staging_dir
         os.makedirs(self.staging_dir, exist_ok=True)
@@ -62,54 +63,6 @@ class ContextMutator(BaseSource):
         
         # Load the dynamic goals
         self.seed_goals = self.strategy.seed_goals.copy()
-
-    async def _call_llm_with_retry(self, session: aiohttp.ClientSession, messages: list, max_retries: int = 3) -> dict:
-        """Executes the LLM call with built-in Markdown stripping and a feedback-driven retry loop."""
-        current_messages = messages.copy()
-        
-        for attempt in range(max_retries):
-            payload = {
-                "model": self.attacker_model,
-                "format": "json",
-                "messages": current_messages,
-                "stream": False
-            }
-
-            try:
-                async with session.post(self.attacker_url, json=payload, timeout=300.0) as response:
-                    if response.status != 200:
-                        self.logger.warning(f"HTTP {response.status} from Attacker LLM.")
-                        await asyncio.sleep(2)
-                        continue
-
-                    result_json = await response.json()
-                    response_text = result_json.get("message", {}).get("content", "{}")
-                    
-                    clean_text = response_text
-                    md_ticks = chr(96) * 3
-                    pattern = rf'{md_ticks}(?:json)?\s*(.*?)\s*{md_ticks}'
-                    
-                    match = re.search(pattern, response_text, re.DOTALL | re.IGNORECASE)
-                    if match:
-                        clean_text = match.group(1)
-                        self.logger.trace("Stripped markdown formatting from LLM response.")
-                        
-                    try:
-                        parsed_data = json.loads(clean_text)
-                        if attempt > 0:
-                            self.logger.info(f"Successfully recovered JSON syntax on attempt {attempt + 1}.")
-                        return parsed_data
-                        
-                    except json.JSONDecodeError as e:
-                        self.logger.warning(f"JSON Parse Error on attempt {attempt + 1}: {e}. Retrying...")
-                        current_messages.append({"role": "assistant", "content": response_text})
-                        current_messages.append({
-                            "role": "user", 
-                            "content": f"Your previous response failed JSON parsing with error: {e}. Please output ONLY valid JSON."
-                        })
-                        
-            except Exception as e:
-                self.logger.error(f"Network error during LLM generation: {e}")
                 
         self.logger.error("Exhausted all JSON correction retries. Generation failed.")
         return {}
@@ -167,7 +120,8 @@ class ContextMutator(BaseSource):
         ]
 
         # 2. Generate the Malicious Payload
-        parsed_data = await self._call_llm_with_retry(session, messages)
+        # --- DELEGATE TO CLIENT ---
+        parsed_data = await self.llm_client.generate_json(session, messages)
         mutations = parsed_data.get("attacks", [])
         
         for attack_data in mutations:
