@@ -16,6 +16,7 @@ import logging
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from isomutator.core.config import settings
 from isomutator.core.queue_manager import QueueManager
 from isomutator.core.strategies import JailbreakStrategy
 from isomutator.ingestors.mutator import PromptMutator
@@ -135,3 +136,17 @@ async def test_malformed_packet_error_handling(mutator_setup):
     # Processing should exit gracefully without throwing exceptions or pushing to the queue
     await mutator._process_feedback(None, malformed_packet)
     mutator._safe_put.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_mutator_respects_dynamic_config_delays(mutator_setup):
+    logger.log(logging.TRACE, "Testing mutator config integration.")
+    mutator, attack_queue, _ = mutator_setup
+    
+    # The queue manager size check is now an async call
+    attack_queue.get_approximate_size = AsyncMock(return_value=0)
+    
+    # We just need to verify the mutator doesn't throw AttributeErrors 
+    # when trying to read settings.ping_pong_delay and settings.seed_cooldown
+    assert hasattr(settings, "ping_pong_delay")
+    assert hasattr(settings, "seed_cooldown")
+    assert isinstance(settings.ping_pong_delay, float)

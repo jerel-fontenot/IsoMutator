@@ -26,6 +26,7 @@ import signal
 
 from isomutator.core.queue_manager import QueueManager
 from isomutator.core.log_manager import LogManager
+from isomutator.core.config import settings
 from isomutator.models.packet import DataPacket
 
 class AsyncStriker(multiprocessing.Process):
@@ -60,8 +61,11 @@ class AsyncStriker(multiprocessing.Process):
         
         async with aiohttp.ClientSession() as session:
             while True:
-                # 1. Pull exactly 1 attack from the queue to ensure sequential CPU processing
-                batch = self.attack_queue.get_batch(target_size=1, max_wait=1.0)
+                # 1. Pull batch from the queue to ensure sequential CPU processing
+                batch = await self.attack_queue.get_batch(
+                    target_size=settings.batch_size, 
+                    max_wait=1.0
+                )
                 if not batch:
                     continue
                     
@@ -73,13 +77,13 @@ class AsyncStriker(multiprocessing.Process):
                 self.logger.trace("Firing payload sequentially...")
 
                 # 3. Fire the payload and wait for the response
-                packet = batch[0]
-                updated_packet = await self._fire_payload(session, packet)
+                for packet in batch:
+                    updated_packet = await self._fire_payload(session, packet)
 
-                # 4. Forward the surviving packet to the AI Judge
-                if updated_packet:
-                    await self.eval_queue.async_put(updated_packet)
-                    self.logger.trace(f"Strike {packet.id[:8]} completed and forwarded to Judge.")
+                    # 4. Forward the surviving packet to the AI Judge
+                    if updated_packet:
+                        await self.eval_queue.async_put(updated_packet)
+                        self.logger.trace(f"Strike {packet.id[:8]} completed and forwarded to Judge.")
 
     async def _fire_payload(self, session: aiohttp.ClientSession, packet: DataPacket) -> DataPacket | None:
         """
@@ -121,7 +125,7 @@ class AsyncStriker(multiprocessing.Process):
                 )
                 
                 upload_url = f"{self.target_url}/upload"
-                async with session.post(upload_url, data=form_data, timeout=30.0) as upload_resp:
+                async with session.post(upload_url, data=form_data, timeout=settings.network_timeout) as upload_resp:
                     if upload_resp.status != 200:
                         self.logger.error(f"Stage 1 Upload failed. Target returned HTTP {upload_resp.status}")
                         return None
@@ -138,7 +142,7 @@ class AsyncStriker(multiprocessing.Process):
                 "query": packet.raw_content
             }
             
-            async with session.post(chat_url, json=payload, timeout=300.0) as response:
+            async with session.post(chat_url, json=payload, timeout=settings.network_timeout) as response:
                 if response.status != 200:
                     error_text = await response.text()
                     self.logger.error(f"Target server rejected strike {packet.id[:8]}: {response.status} - {error_text}")

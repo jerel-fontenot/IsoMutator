@@ -115,15 +115,11 @@ async def test_happy_path_context_staging(context_mutator_setup):
 async def test_edge_case_empty_generation(context_mutator_setup):
     """If the LLM fails to generate anything, no files should be written and no packets dispatched."""
     mutator, mock_queue = context_mutator_setup
-    
-    # Mock LLM failing completely
     mock_session = MagicMock()
-    mock_session.post.return_value = MockLLMResponse('')
     
-    # FIX: Use default MagicMock
     with patch("aiofiles.open") as mock_aio_open:
-        # Override the retry loop to fail instantly for the test
-        with patch.object(mutator, '_call_llm_with_retry', return_value={}):
+        # UPDATED: Mock the injected llm_client's generate_json method with AsyncMock
+        with patch.object(mutator.llm_client, 'generate_json', new_callable=AsyncMock, return_value={}):
             await mutator._generate_staged_seeds(mock_session)
             
             mock_aio_open.assert_not_called()
@@ -135,10 +131,11 @@ async def test_edge_case_empty_generation(context_mutator_setup):
 async def test_error_handling_io_failure(context_mutator_setup):
     """Verifies that an OS-level file error doesn't crash the async loop."""
     mutator, mock_queue = context_mutator_setup
-    
     mock_session = MagicMock()
-    # Mock the LLM returning a valid response so we reach the file I/O stage
-    with patch.object(mutator, '_call_llm_with_retry', return_value={"attacks": [{"strategy": "test", "prompt": "payload"}]}):
+    
+    # UPDATED: Mock the injected llm_client's generate_json method with AsyncMock
+    mock_payload = {"attacks": [{"strategy": "test", "prompt": "payload"}]}
+    with patch.object(mutator.llm_client, 'generate_json', new_callable=AsyncMock, return_value=mock_payload):
         
         # Force aiofiles.open to raise a PermissionError
         with patch("aiofiles.open", side_effect=PermissionError("Permission denied: '/tmp/mock_staging/...'")):

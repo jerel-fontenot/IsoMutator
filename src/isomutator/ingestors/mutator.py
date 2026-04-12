@@ -22,12 +22,12 @@ import aiohttp
 import json
 import logging
 import re
-import llm_client
 
 from isomutator.ingestors.base import BaseSource
-from isomutator.ingestors.llm_client import AttackerLLMClient
+from isomutator.ingestors.llm_client import AttackerClientInterface, LLMClientFactory
 from isomutator.models.packet import DataPacket
 from isomutator.core.strategies import RedTeamStrategy
+from isomutator.core.config import settings
 
 # Establish TRACE level logging if it does not exist
 TRACE_LEVEL_NUM = 5
@@ -43,14 +43,19 @@ logging.Logger.trace = trace
 
 
 class PromptMutator(BaseSource):
-    def __init__(self, attack_queue, feedback_queue, strategy: RedTeamStrategy):
+    def __init__(self, attack_queue, feedback_queue, strategy: RedTeamStrategy, llm_client: AttackerClientInterface = None):
         super().__init__(attack_queue, name="PromptMutator")
         self.attack_queue = attack_queue
         self.feedback_queue = feedback_queue
         self.strategy = strategy
         
-        # --- OOP Dependency Injection ---
-        self.llm_client = llm_client or AttackerLLMClient()
+        # --- OOP Dependency Injection & Factory Integration ---
+        self.llm_client = llm_client or LLMClientFactory.create(
+            api_type=settings.attacker_api_type,
+            url=settings.attacker_url,
+            model=settings.attacker_model
+        )
+        self.logger.trace(f"PromptMutator initialized with LLM Client mapping to {self.llm_client.url}")
         
         # Load the dynamic goals
         self.seed_goals = self.strategy.seed_goals.copy()
@@ -69,92 +74,35 @@ class PromptMutator(BaseSource):
                 return True
         return False
 
-    async def _call_llm_with_retry(self, session: aiohttp.ClientSession, messages: list, max_retries: int = 3) -> dict:
-        """
-        Executes the LLM call with built-in Markdown stripping and a feedback-driven retry loop.
-        """
-        current_messages = messages.copy()
-        
-        for attempt in range(max_retries):
-            payload = {
-                "model": self.attacker_model,
-                "format": "json",
-                "messages": current_messages,
-                "stream": False
-            }
-
-            try:
-                async with session.post(self.attacker_url, json=payload, timeout=300.0) as response:
-                    if response.status != 200:
-                        self.logger.warning(f"HTTP {response.status} from Attacker LLM.")
-                        await asyncio.sleep(2)
-                        continue
-
-                    result_json = await response.json()
-                    response_text = result_json.get("message", {}).get("content", "{}")
-                    
-                    # 1. Regex Markdown Stripping
-                    clean_text = response_text
-                    
-                    # Workaround: Using chr(96) * 3 to create the three backticks safely without breaking UI parsers
-                    md_ticks = chr(96) * 3
-                    pattern = rf'{md_ticks}(?:json)?\s*(.*?)\s*{md_ticks}'
-                    
-                    match = re.search(pattern, response_text, re.DOTALL | re.IGNORECASE)
-                    if match:
-                        clean_text = match.group(1)
-                        self.logger.trace("Stripped markdown formatting from LLM response.")
-                        
-                    # 2. Strict Parse
-                    try:
-                        parsed_data = json.loads(clean_text)
-                        if attempt > 0:
-                            self.logger.info(f"Successfully recovered JSON syntax on attempt {attempt + 1}.")
-                        return parsed_data
-                        
-                    except json.JSONDecodeError as e:
-                        self.logger.warning(f"JSON Parse Error on attempt {attempt + 1}: {e}. Retrying...")
-                        # Append the failure to the conversation history so the LLM can self-correct
-                        current_messages.append({"role": "assistant", "content": response_text})
-                        current_messages.append({
-                            "role": "user", 
-                            "content": f"Your previous response failed JSON parsing with error: {e}. "
-                                       f"Please output ONLY valid JSON. Remove trailing commas and ensure quotes are escaped."
-                        })
-                        
-            except Exception as e:
-                self.logger.error(f"Network error during LLM generation: {e}")
-                
-        self.logger.error("Exhausted all JSON correction retries. Generation failed.")
-        return {}
-
     async def listen(self):
         self.logger.info("Stateful AI Mutator online. Engaging Ping-Pong CPU lock...")
         
         last_seed_time = 0.0
-        seed_cooldown = 15.0 
         
         try:
             async with aiohttp.ClientSession() as session:
                 while True:
                     # --- THE PING-PONG LOCK ---
-                    if self.attack_queue.get_approximate_size() > 0:
-                        await asyncio.sleep(2.0)
+                    if (await self.attack_queue.get_approximate_size()) > 0:
+                        await asyncio.sleep(settings.ping_pong_delay)
                         continue
                         
-                    # --- PRIORITY 1: Process ONE Feedback Packet (MCTS Branching) ---
-                    feedback_batch = self.feedback_queue.get_batch(target_size=1, max_wait=0.5)
+                    # --- PRIORITY 1: Process Feedback Packets (MCTS Branching) ---
+                    feedback_batch = await self.feedback_queue.get_batch(
+                        target_size=settings.batch_size, 
+                        max_wait=0.5
+                    )
                     
                     if feedback_batch:
-                        packet = feedback_batch[0]
-                        self.logger.info(f"Analyzing Turn {packet.turn_count} feedback for packet {packet.id[:8]}...")
-                        await self._process_feedback(session, packet)
-                        await asyncio.sleep(0)
+                        for packet in feedback_batch:
+                            self.logger.info(f"Analyzing Turn {packet.turn_count} feedback for packet {packet.id[:8]}...")
+                            await self._process_feedback(session, packet)
+                            await asyncio.sleep(0)
                         continue 
                         
                     # --- PRIORITY 2: Generate New Seeds ---
                     current_time = asyncio.get_event_loop().time()
-                    if (current_time - last_seed_time) > seed_cooldown:
+                    if (current_time - last_seed_time) > settings.seed_cooldown:
                         self.logger.info("Feedback queue empty. Brainstorming new seed attacks...")
                         await self._generate_new_seeds(session)
                         last_seed_time = asyncio.get_event_loop().time()
@@ -277,3 +225,8 @@ class PromptMutator(BaseSource):
                     )
                     await self._safe_put(packet)
                     await asyncio.sleep(0)
+
+def run_mutator_process(attack_queue, feedback_queue, strategy):
+    """Top-level function to safely spawn the Mutator in a new OS process."""
+    mutator = PromptMutator(attack_queue, feedback_queue, strategy)
+    asyncio.run(mutator.listen())

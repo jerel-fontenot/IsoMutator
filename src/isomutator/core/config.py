@@ -16,14 +16,27 @@ _url_validator = TypeAdapter(AnyHttpUrl)
 
 class IsoConfig(BaseSettings):
     batch_size: int = 4
-    max_wait_seconds: float = 1.0
     shutdown_timeout: float = 15.0
     db_path: str = "data/isomutator.db"
     worker_count: int = 0
+    striker_count: int = 1
+    judge_count: int = 1
 
     # Remote Targeting Defaults
     target_url: str = "http://192.9.159.125:8000"
+    
+    # Attacker LLM Settings
     attacker_url: str = "http://192.9.159.125:11434"
+    attacker_api_type: str = "ollama"
+    attacker_model: str = "llama3.2"
+
+    # Message Broker
+    redis_url: str = "redis://localhost:6379/0"
+    
+    # Distributed Tuning Sliders
+    ping_pong_delay: float = 2.0
+    seed_cooldown: float = 15.0
+    network_timeout: float = 300.0
 
     @field_validator('target_url', 'attacker_url')
     @classmethod

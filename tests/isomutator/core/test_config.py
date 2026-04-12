@@ -44,7 +44,7 @@ def test_config_default_remote_targets():
     config = IsoConfig()
     
     assert config.target_url == "http://192.9.159.125:8000"
-    assert config.attacker_url == "http://192.9.159.125:11434"
+    assert config.attacker_url == "http://192.9.159.125:8000"
 
 
 @patch.dict('os.environ', {'ISO_TARGET_URL': 'http://10.0.0.5:9000'})
@@ -71,3 +71,29 @@ def test_config_invalid_url_fails_fast():
     # Pydantic's AnyHttpUrl type should raise a ValidationError on bad formats
     with pytest.raises(ValidationError):
         IsoConfig()
+
+# --- 4. Tuning Sliders Tests ---
+def test_config_default_tuning_sliders():
+    logger.log(logging.TRACE, "Testing default tuning slider values.")
+    config = IsoConfig()
+    
+    # These must exist to prevent the Mutator/Striker from throwing AttributeErrors
+    assert config.ping_pong_delay == 2.0
+    assert config.seed_cooldown == 15.0
+    assert config.network_timeout == 300.0
+
+
+@patch.dict('os.environ', {
+    'ISO_PING_PONG_DELAY': '0.5',
+    'ISO_SEED_COOLDOWN': '5.0',
+    'ISO_NETWORK_TIMEOUT': '60.0'
+})
+def test_config_tuning_sliders_override():
+    logger.log(logging.TRACE, "Testing environment override of tuning sliders.")
+    config = IsoConfig()
+    
+    # The GUI will update the .env file (or inject these into the process environment) 
+    # when the user moves the sliders and clicks Start.
+    assert config.ping_pong_delay == 0.5
+    assert config.seed_cooldown == 5.0
+    assert config.network_timeout == 60.0

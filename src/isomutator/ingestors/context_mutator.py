@@ -18,17 +18,15 @@ TECHNOLOGY QUIRKS:
 import asyncio
 import aiohttp
 import aiofiles
-import json
 import logging
 import os
-import re
 import uuid
-import llm_client
 
 from isomutator.ingestors.base import BaseSource
 from isomutator.models.packet import DataPacket
 from isomutator.core.strategies import ContextInjectionStrategy
-from isomutator.ingestors.llm_client import AttackerLLMClient
+from isomutator.core.config import settings
+from isomutator.ingestors.llm_client import AttackerClientInterface, LLMClientFactory
 
 # Establish TRACE level logging if it does not exist
 TRACE_LEVEL_NUM = 5
@@ -44,7 +42,7 @@ logging.Logger.trace = trace
 
 
 class ContextMutator(BaseSource):
-    def __init__(self, attack_queue, feedback_queue, strategy: ContextInjectionStrategy, staging_dir: str = "/tmp/isomutator_staging"):
+    def __init__(self, attack_queue, feedback_queue, strategy: ContextInjectionStrategy, staging_dir: str = "/tmp/isomutator_staging", llm_client: AttackerClientInterface = None):
         super().__init__(attack_queue, name="ContextMutator")
         self.attack_queue = attack_queue
         self.feedback_queue = feedback_queue
@@ -54,8 +52,13 @@ class ContextMutator(BaseSource):
             raise TypeError("ContextMutator requires a ContextInjectionStrategy implementation.")
         self.strategy = strategy
         
-        # --- OOP Dependency Injection ---
-        self.llm_client = llm_client or AttackerLLMClient()
+        # --- OOP Dependency Injection & Factory Integration ---
+        self.llm_client = llm_client or LLMClientFactory.create(
+            api_type=settings.attacker_api_type,
+            url=settings.attacker_url,
+            model=settings.attacker_model
+        )
+        self.logger.trace(f"ContextMutator initialized with LLM Client mapping to {self.llm_client.url}")
         
         self.staging_dir = staging_dir
         os.makedirs(self.staging_dir, exist_ok=True)
@@ -63,23 +66,19 @@ class ContextMutator(BaseSource):
         
         # Load the dynamic goals
         self.seed_goals = self.strategy.seed_goals.copy()
-                
-        self.logger.error("Exhausted all JSON correction retries. Generation failed.")
-        return {}
 
     async def listen(self):
         """The main asynchronous loop driving the Dual-Stage generation."""
         self.logger.info("Contextual AI Mutator online. Engaging Ping-Pong CPU lock...")
         
         last_seed_time = 0.0
-        seed_cooldown = 15.0 
         
         try:
             async with aiohttp.ClientSession() as session:
                 while True:
                     # --- THE PING-PONG LOCK ---
-                    if self.attack_queue.get_approximate_size() > 0:
-                        await asyncio.sleep(2.0)
+                    if (await self.attack_queue.get_approximate_size()) > 0:
+                        await asyncio.sleep(settings.ping_pong_delay)
                         continue
                         
                     # (Feedback processing omitted in V1 of Context Injection; 
@@ -87,7 +86,7 @@ class ContextMutator(BaseSource):
                     
                     # --- GENERATE NEW STAGED PAYLOADS ---
                     current_time = asyncio.get_event_loop().time()
-                    if (current_time - last_seed_time) > seed_cooldown:
+                    if (current_time - last_seed_time) > settings.seed_cooldown:
                         self.logger.info("Brainstorming new contextual payloads...")
                         await self._generate_staged_seeds(session)
                         last_seed_time = asyncio.get_event_loop().time()

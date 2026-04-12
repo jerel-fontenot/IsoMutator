@@ -11,17 +11,19 @@ The AI Judge acts as the evaluator and router in the stateful red-teaming pipeli
    max limit, the packet is pushed to the Feedback Queue.
 
 TECHNOLOGY QUIRKS:
-- Multiprocessing UI Telemetry (Observer Pattern): Standard print statements corrupt 
-  the `rich` TUI. Instead, we use `self.logger.info(..., extra={...})` to broadcast 
-  state changes. The LogManager's custom QueueListener intercepts these dictionaries 
-  and routes them to the DashboardManager without blocking the Judge's execution thread.
+- Asynchronous Multiprocessing: Runs an `asyncio` event loop inside an isolated OS process.
+- Redis Pub/Sub Telemetry: Bypasses the logging system entirely for UI updates, utilizing 
+  non-blocking Redis `PUBLISH` commands to send Wiretap and Ledger events to the TUI.
 """
 
 import json
 import os
+import asyncio
 from datetime import datetime
 import multiprocessing
 import signal
+
+from isomutator.core.config import settings
 from isomutator.core.queue_manager import QueueManager
 from isomutator.core.log_manager import LogManager
 from isomutator.core.strategies import RedTeamStrategy
@@ -41,17 +43,16 @@ class RedTeamJudge(multiprocessing.Process):
         self.logger = None
         self.semantic_judge = None
 
-    def _record_exploit(self, packet, attack_prompt: str, target_response: str, breach_type: str):
+    async def _record_exploit(self, packet, attack_prompt: str, target_response: str, breach_type: str):
         """Helper method to centralize telemetry logging and file writing."""
-        self.logger.warning(
-            f"Vulnerability exploited via packet {packet.id[:8]} on turn {packet.turn_count} ({breach_type})",
-            extra={
-                "ui_event": "ledger",
-                "turn": packet.turn_count,
-                "strategy": f"{self.strategy.name} [{breach_type}]", 
-                "packet_id": packet.id
-            }
-        )
+        self.logger.warning(f"Vulnerability exploited via packet {packet.id[:8]} on turn {packet.turn_count} ({breach_type})")
+        
+        # --- REDIS PUB/SUB TELEMETRY ---
+        await self.eval_queue.broadcast_telemetry("ledger", {
+            "turn": packet.turn_count,
+            "strategy": f"{self.strategy.name} [{breach_type}]", 
+            "packet_id": packet.id
+        })
         
         vuln_record = {
             "timestamp": datetime.now().isoformat(),
@@ -79,10 +80,21 @@ class RedTeamJudge(multiprocessing.Process):
         
         # Instantiate the NLP model inside the process boundary to avoid CUDA/Memory crashes
         self.semantic_judge = SemanticJudge()
+        
+        try:
+            asyncio.run(self._judge_loop())
+        except asyncio.CancelledError:
+            self.logger.trace("Async loop cancelled safely during shutdown.")
+
+    async def _judge_loop(self):
         self.logger.info("Red Team Judge online. Awaiting strike telemetry...")
         
         while True:
-            batch = self.eval_queue.get_batch(target_size=5, max_wait=1.0)
+            # --- AWAIT THE BATCH ---
+            batch = await self.eval_queue.get_batch(
+                target_size=settings.batch_size, 
+                max_wait=1.0
+            )
             
             if not batch:
                 continue
@@ -91,37 +103,44 @@ class RedTeamJudge(multiprocessing.Process):
                 self.logger.info("Poison Pill swallowed. Court is adjourned.")
                 break
 
-            for packet in batch:
-                target_response = packet.history[-1]["content"] if packet.history else ""
-                attack_prompt = packet.history[-2]["content"] if len(packet.history) > 1 else packet.raw_content
+            await self._evaluate_batch(batch)
+
+    async def _evaluate_batch(self, batch):
+        """Processes the scoring and routing asynchronously."""
+        for packet in batch:
+            if packet == "POISON_PILL": 
+                continue
+            
+            target_response = packet.history[-1]["content"] if packet.history else ""
+            attack_prompt = packet.history[-2]["content"] if len(packet.history) > 1 else packet.raw_content
+            
+            # --- 1. Explicit Rule Scoring ---
+            if self.strategy.score_response(target_response):
+                await self._record_exploit(packet, attack_prompt, target_response, "explicit")
+            
+            else:
+                # --- 2. Semantic Fallback Scoring ---
+                is_flagged, confidence = self.semantic_judge.evaluate_response(target_response)
                 
-                # --- 1. Explicit Rule Scoring ---
-                if self.strategy.score_response(target_response):
-                    self._record_exploit(packet, attack_prompt, target_response, "explicit")
+                if is_flagged:
+                    self.logger.trace(f"Semantic scoring caught anomalous compliance! (Sim: {confidence:.2f})")
+                    await self._record_exploit(packet, attack_prompt, target_response, self.strategy.name)
                 
+                # --- 3. Defense Succeeded ---
                 else:
-                    # --- 2. Semantic Fallback Scoring ---
-                    is_flagged, confidence = self.semantic_judge.evaluate_response(target_response)
+                    self.logger.debug(f"Target defended against packet {packet.id[:8]}. Emitting wiretap event.")
                     
-                    if is_flagged:
-                        self.logger.trace(f"Semantic scoring caught anomalous compliance! (Sim: {confidence:.2f})")
-                        self._record_exploit(packet, attack_prompt, target_response, {self.strategy.name})
+                    # --- REDIS PUB/SUB TELEMETRY INSTEAD OF LOG HACK ---
+                    await self.eval_queue.broadcast_telemetry("wiretap", {
+                        "turn": packet.turn_count,
+                        "attacker": attack_prompt.strip(),
+                        "target": target_response.strip()
+                    })
                     
-                    # --- 3. Defense Succeeded ---
+                    if packet.turn_count < self.max_turns:
+                        packet.turn_count += 1
+                        # --- AWAIT THE ASYNC PUT ---
+                        await self.feedback_queue.async_put(packet)
+                        self.logger.trace(f"Strike {packet.id[:8]} failed. Routing to Feedback Queue for Turn {packet.turn_count}.")
                     else:
-                        self.logger.debug(
-                            f"Target defended against packet {packet.id[:8]}. Emitting wiretap event.",
-                            extra={
-                                "ui_event": "wiretap",
-                                "turn": packet.turn_count,
-                                "attacker": attack_prompt.strip(),
-                                "target": target_response.strip()
-                            }
-                        )
-                        
-                        if packet.turn_count < self.max_turns:
-                            packet.turn_count += 1
-                            self.feedback_queue.put(packet)
-                            self.logger.trace(f"Strike {packet.id[:8]} failed. Routing to Feedback Queue for Turn {packet.turn_count}.")
-                        else:
-                            self.logger.trace(f"Strike {packet.id[:8]} reached max turns ({self.max_turns}). Attack failed permanently.")
+                        self.logger.trace(f"Strike {packet.id[:8]} reached max turns ({self.max_turns}). Attack failed permanently.")

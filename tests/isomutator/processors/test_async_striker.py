@@ -15,8 +15,9 @@ TECHNOLOGY QUIRKS:
 
 import pytest
 import asyncio
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
+from isomutator.core.config import settings
 from isomutator.processors.striker import AsyncStriker
 from isomutator.models.packet import DataPacket
 
@@ -43,9 +44,9 @@ class MockAiohttpResponse:
 # --- Fixtures ---
 @pytest.fixture
 def mock_queues():
-    """Provides mocked QueueManager objects."""
-    attack_queue = MagicMock()
-    eval_queue = MagicMock()
+    """Provides AsyncMocks for the new Redis-backed QueueManagers."""
+    attack_queue = AsyncMock()
+    eval_queue = AsyncMock()
     log_queue = MagicMock()
     return attack_queue, eval_queue, log_queue
 
@@ -211,3 +212,22 @@ async def test_fire_payload_strict_contract(striker, mock_session):
     # 4. Assert Inbound Extraction
     assert result_packet.history[-1]["content"] == "I am the CorpRAG target and I am functioning.", \
         "Striker failed to extract the 'answer' key from the target response."
+    
+@pytest.mark.asyncio
+async def test_striker_respects_dynamic_batch_size(striker, mock_session):
+    """
+    ALGORITHM SUMMARY:
+    Validates that the Striker reads the dynamic batch size from settings 
+    instead of hardcoding target_size=1, allowing for GUI-controlled scaling.
+    """
+    # Setup the mock queue to return a poison pill so the loop exits immediately 
+    striker.attack_queue.get_batch.return_value = ["POISON_PILL"]
+    
+    # Override the setting for this test
+    settings.batch_size = 8
+    
+    # Execute the loop
+    await striker._strike_loop()
+    
+    # Verify the queue manager was queried with the dynamic target_size
+    striker.attack_queue.get_batch.assert_called_with(target_size=8, max_wait=1.0)
