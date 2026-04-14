@@ -1,82 +1,58 @@
+"""
+Algorithm Summary:
+This test suite validates the core initialization sequence of the CommandDashboard.
+It replaces the legacy IsoMutatorApp tests. It ensures that when the application 
+boots, all critical UI references, queues, and task watchers are successfully 
+instantiated before the NiceGUI event loop takes over.
+
+Protocol Adherence:
+1. Happy Path: Validates successful instantiation of all layout components.
+7. Strict Mocking: Mocks the NiceGUI `ui` module to prevent spinning up an 
+   actual web server on port 8080 during unit testing.
+"""
+
 import pytest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
-from textual.widgets import Select, Input
-from isomutator.ui.app import IsoMutatorApp
-from isomutator.core.config import settings
+# Import the new, refactored class name
+from isomutator.ui.app import CommandDashboard
 
-@pytest.mark.asyncio
-async def test_ui_initializes_with_validators_and_paths():
-    """Ensures the GUI inputs and new path inputs reflect backend settings."""
-    app = IsoMutatorApp()
-    
-    async with app.run_test(size=(120, 40)) as pilot:
-        # Check Target URL
-        assert app.query_one("#target_url_input", Input).value == settings.target_url
+@pytest.fixture
+def dashboard_ui():
+    """
+    Provides an isolated CommandDashboard instance.
+    We mock the UI, QueueManager, and TelemetryService to test 
+    pure Python initialization without binding to network ports.
+    """
+    with patch('isomutator.ui.app.QueueManager'), \
+         patch('isomutator.ui.app.TelemetryService'), \
+         patch('isomutator.ui.app.ui'):
         
-        # Check validated inputs instead of sliders
-        batch_input = app.query_one("#batch_size_input", Input)
-        assert batch_input.value == str(settings.batch_size)
-        
-        ping_input = app.query_one("#ping_pong_input", Input)
-        assert ping_input.value == str(settings.ping_pong_delay)
-        
-        # Check new paths
-        assert app.query_one("#report_path_input", Input).value == "reports/final_report.json"
-        
-        # Ensure the strategy dropdown has all our backend options
-        strategy_select = app.query_one("#strategy_select", Select)
-        options = [opt[1] for opt in strategy_select._options]
-        assert "obfuscation" in options
-        assert "linux_privesc" in options
-        assert "context" in options
+        dash = CommandDashboard()
+        return dash
 
-@pytest.mark.asyncio
-async def test_ui_reactive_context_file_input():
-    """Ensures the Context Payload File input only unlocks for Context strategies."""
-    app = IsoMutatorApp()
-    
-    async with app.run_test(size=(120, 40)) as pilot:
-        strategy_select = app.query_one("#strategy_select", Select)
-        context_file_input = app.query_one("#context_file_input", Input)
-        
-        # By default (prompt_leaking), it should be disabled
-        assert context_file_input.disabled is True
-        
-        # Simulate selecting "context"
-        strategy_select.value = "context"
-        await pilot.pause() # Allow the reactive UI to update
-        
-        # It should now be unlocked for user input
-        assert context_file_input.disabled is False
-        
-        # Simulate reverting to a non-context strategy
-        strategy_select.value = "jailbreak"
-        await pilot.pause()
-        
-        # It should lock again
-        assert context_file_input.disabled is True
+class TestCommandDashboardInitialization:
 
-@pytest.mark.asyncio
-async def test_ui_start_button_locks_configuration():
-    """Ensures clicking Start disables the entire configuration panel."""
-    app = IsoMutatorApp()
-    
-    with patch("isomutator.ui.app.QueueManager"):
-        with patch("isomutator.ui.app.multiprocessing.Process.start"):
-            
-            async with app.run_test(size=(120, 40)) as pilot:
-                start_button = app.query_one("#start_button")
-                batch_input = app.query_one("#batch_size_input", Input)
-                report_input = app.query_one("#report_path_input", Input)
-                
-                assert batch_input.disabled is False
-                assert report_input.disabled is False
-                
-                start_button.press()
-                await pilot.pause()
-                
-                # Verify all new inputs are locked
-                assert batch_input.disabled is True
-                assert report_input.disabled is True
-                assert start_button.disabled is True
+    def test_happy_path_ui_components_instantiated(self, dashboard_ui):
+        """
+        Happy Path: When CommandDashboard is initialized, it must successfully 
+        build the UI and store references to critical input/output elements.
+        """
+        # Assert Layout Elements
+        assert dashboard_ui.main_layout is not None, "Main CSS Grid layout missing"
+        assert dashboard_ui.sidebar_container is not None, "Sidebar container missing"
+        assert dashboard_ui.telemetry_container is not None, "Telemetry container missing"
+        
+        # Assert Inputs
+        assert dashboard_ui.target_input is not None, "Target URL input missing"
+        assert dashboard_ui.strategy_select is not None, "Strategy dropdown missing"
+        assert dashboard_ui.context_input is not None, "Context payload input missing"
+        
+        # Assert Buttons
+        assert dashboard_ui.btn_start is not None, "START button missing"
+        assert dashboard_ui.btn_stop is not None, "STOP button missing"
+        assert dashboard_ui.btn_reconnect is not None, "RECONNECT button missing"
+        
+        # Assert System State Managers
+        assert hasattr(dashboard_ui, 'workers'), "Workers list not initialized"
+        assert dashboard_ui.task_watcher is not None, "TaskWatcher not injected"

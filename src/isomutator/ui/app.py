@@ -13,6 +13,7 @@ import asyncio
 import multiprocessing
 import logging
 from logging.handlers import QueueListener
+from typing import Dict, Any
 
 from nicegui import ui, app
 
@@ -20,7 +21,9 @@ from isomutator.core.config import settings
 from isomutator.core.queue_manager import QueueManager
 from isomutator.processors.striker import AsyncStriker
 from isomutator.processors.judge import RedTeamJudge
+from isomutator.core.telemetry_service import TelemetryService
 from isomutator.ingestors.mutator import PromptMutator, run_mutator_process
+from isomutator.core.task_watcher import TaskWatcher
 from isomutator.core.strategies import (
     JailbreakStrategy, 
     PromptLeakingStrategy, 
@@ -29,11 +32,50 @@ from isomutator.core.strategies import (
     LinuxPrivescStrategy
 )
 
+# Ensure TRACE level is defined per project specifications
+if not hasattr(logging, 'TRACE'):
+    logging.TRACE = 5
+    logging.addLevelName(logging.TRACE, 'TRACE')
+
+logger = logging.getLogger(__name__)
+
+"""
+Algorithm Summary (Dashboard State Updater):
+This function acts as the asynchronous bridge between the TelemetryService and the 
+NiceGUI frontend. It is triggered routinely by a UI timer. It queries the backend 
+service for real-time pipeline metrics and safely mutates a centralized state dictionary. 
+The UI components are reactively bound to this dictionary, allowing them to update 
+automatically without blocking the main event loop.
+"""
+async def update_dashboard_state(telemetry_service: Any, ui_state: Dict[str, Any]) -> None:
+    """
+    Asynchronously fetches telemetry metrics and mutates the reactive UI state dictionary.
+    
+    Args:
+        telemetry_service: The initialized TelemetryService instance.
+        ui_state (dict): The dictionary bound to the NiceGUI frontend elements.
+    """
+    logger.log(logging.TRACE, "Entering update_dashboard_state algorithm.")
+    
+    # Fetch metrics safely from the backend service
+    metrics = await telemetry_service.get_dashboard_metrics()
+    
+    # Mutate the state dictionary (NiceGUI will automatically detect these changes)
+    ui_state["broker_status"] = metrics.get("broker_status", "Unknown")
+    ui_state["attack_queue_depth"] = metrics.get("attack_queue_depth", -1)
+    ui_state["feedback_queue_depth"] = metrics.get("feedback_queue_depth", -1)
+    
+    logger.debug(f"UI state successfully updated with metrics: {metrics}")
+    logger.log(logging.TRACE, "Exiting update_dashboard_state algorithm.")
+
 class CommandDashboard:
     def __init__(self):
         self.workers = []
         self.telemetry_task = None
         self.build_ui()
+
+        # Instantiate the Task Watcher
+        self.task_watcher = TaskWatcher(logger=logger)
 
     def build_ui(self):
         ui.colors(primary='#2b2b2b', secondary='#4a4a4a', accent='#f39c12')
@@ -41,10 +83,15 @@ class CommandDashboard:
         with ui.header().classes('bg-primary text-white p-4'):
             ui.label('IsoMutator Command Center').classes('text-2xl font-bold')
 
-        with ui.row().classes('w-full h-full gap-4 p-4').style('flex-wrap: nowrap;'):
+        # --- ARCHITECTURE REFACTOR: CSS Grid Layout ---
+        # We replace the Flex row with a strict 12-column grid.
+        self.main_layout = ui.element('div').classes('w-full h-[calc(100vh-80px)] grid grid-cols-12 gap-4 p-4')
+        with self.main_layout:
             
             # --- LEFT SIDEBAR (Configuration Panel) ---
-            with ui.card().classes('w-1/4 h-full flex flex-col gap-2'):
+            # Spans 3 of the 12 columns
+            self.sidebar_container = ui.card().classes('col-span-3 h-full flex flex-col gap-2')
+            with self.sidebar_container:
                 ui.label('Configuration').classes('text-xl font-bold border-b border-gray-600 pb-2')
                 
                 self.target_input = ui.input('Target URL', value=settings.target_url).classes('w-full')
@@ -58,19 +105,12 @@ class CommandDashboard:
                         'linux_privesc': 'Linux PrivEsc'
                     }, 
                     value='prompt_leaking', 
-                    label='Attack Strategy'
+                    label='Attack Strategy',
+                    on_change=self._on_strategy_change
                 ).classes('w-full')
 
                 self.context_input = ui.input('Context Payload File', placeholder='Path to PDF/TXT...').classes('w-full')
                 self.context_input.disable()
-                
-                # Reactive Event
-                def on_strategy_change(e):
-                    if e.value == 'context':
-                        self.context_input.enable()
-                    else:
-                        self.context_input.disable()
-                self.strategy_select.on('update:model-value', on_strategy_change)
 
                 ui.label('Tuning & Scaling').classes('font-bold mt-4')
                 
@@ -85,7 +125,6 @@ class CommandDashboard:
 
                 ui.separator()
                 
-                # --- HORIZONTAL SCALING CONTROLS ---
                 self.striker_slider = ui.slider(min=1, max=16, value=settings.striker_count).classes('w-full')
                 ui.label().bind_text_from(self.striker_slider, 'value', backward=lambda v: f'Striker Cores: {v}')
 
@@ -95,40 +134,80 @@ class CommandDashboard:
                 ui.separator()
                 self.report_input = ui.input('Report Output Path', value='reports/final_report.json').classes('w-full')
 
-                # Master Controls
+                # Master Controls (Now including RECONNECT)
                 with ui.row().classes('w-full gap-2 mt-auto'):
                     self.btn_start = ui.button('START', color='positive', on_click=self.action_start_wargame).classes('flex-grow')
-    
-                    # Split these so btn_stop actually stores the button object!
+                    self.btn_reconnect = ui.button('RECONNECT', color='info', on_click=self.action_reconnect_wargame).classes('flex-grow')
+                    
                     self.btn_stop = ui.button('STOP', color='negative', on_click=self.action_stop_wargame).classes('flex-grow')
                     self.btn_stop.disable() 
     
                     self.btn_flush = ui.button('FLUSH', color='warning', on_click=self.action_emergency_flush).classes('flex-grow')
 
             # --- MAIN DASHBOARD (Telemetry) ---
-            with ui.column().classes('w-3/4 h-full gap-4'):
+            # Spans the remaining 9 columns, aggressively filling the right side of the screen
+            self.telemetry_container = ui.column().classes('col-span-9 h-full gap-4 flex-nowrap')
+            with self.telemetry_container:
                 
-                # Wiretap Log
-                with ui.card().classes('w-full h-1/3'):
+                # Wiretap Log (Top 1/3)
+                with ui.card().classes('w-full h-1/3 min-h-[250px]'):
                     ui.label('Live Wiretap (Attacker vs Target)').classes('font-bold border-b pb-1')
                     self.wiretap_log = ui.log().classes('w-full h-full bg-black text-green-400 font-mono text-sm')
 
-                with ui.row().classes('w-full h-2/3 gap-4'):
-                    # Ledger Table
-                    with ui.card().classes('w-1/2 h-full flex flex-col'):
-                        ui.label('Vulnerability Ledger').classes('font-bold border-b pb-1 text-red-500')
+                # Bottom 2/3 Row
+                with ui.row().classes('w-full flex-grow gap-4 flex-nowrap'):
+                    
+                    # --- BOUNDARY ENFORCEMENT: Ledger Table ---
+                    # Added 'overflow-y-auto' and 'flex-grow' to constrain the table to this parent card
+                    self.ledger_container = ui.card().classes('w-1/2 flex-grow flex flex-col overflow-y-auto')
+                    with self.ledger_container:
+                        ui.label('Vulnerability Ledger').classes('font-bold border-b pb-1 text-red-500 sticky top-0 bg-white z-10 w-full')
                         self.ledger_table = ui.table(
                             columns=[
                                 {'name': 'turn', 'label': 'Turn', 'field': 'turn', 'sortable': True},
                                 {'name': 'id', 'label': 'Packet ID', 'field': 'id'},
                                 {'name': 'strategy', 'label': 'Strategy', 'field': 'strategy'},
                             ], rows=[], row_key='id'
-                        ).classes('w-full flex-grow')
+                        ).classes('w-full mt-2')
 
-                    # System Diagnostics
-                    with ui.card().classes('w-1/2 h-full flex flex-col'):
-                        ui.label('Engine Diagnostics').classes('font-bold border-b pb-1 text-yellow-500')
-                        self.system_log = ui.log().classes('w-full flex-grow bg-gray-900 text-gray-300 font-mono text-sm')
+                    # --- Mission Control Telemetry ---
+                    self.dashboard_state = {
+                        "broker_status": "Unknown",
+                        "attack_queue_depth": 0,
+                        "feedback_queue_depth": 0
+                    }
+                    self.polling_qm = QueueManager(queue_name="telemetry")
+                    self.telemetry_service = TelemetryService(queue_manager=self.polling_qm)
+
+                    with ui.card().classes('w-1/2 flex-grow flex flex-col bg-slate-50'):
+                        ui.label('Mission Control').classes('font-bold border-b border-slate-300 pb-1 text-slate-800')
+                        
+                        with ui.column().classes('w-full flex-grow justify-center gap-4 mt-2'):
+                            # Broker Status
+                            with ui.row().classes('w-full justify-between items-center bg-white p-2 rounded shadow-sm'):
+                                ui.label('Broker Status').classes('text-xs font-semibold text-gray-500 uppercase')
+                                ui.label().bind_text_from(self.dashboard_state, 'broker_status').classes('text-lg font-bold text-blue-600')
+                                
+                            # Attack Queue Depth
+                            with ui.row().classes('w-full justify-between items-center bg-white p-2 rounded shadow-sm'):
+                                ui.label('Attack Queue Depth').classes('text-xs font-semibold text-gray-500 uppercase')
+                                ui.label().bind_text_from(self.dashboard_state, 'attack_queue_depth').classes('text-lg font-bold text-amber-500')
+                                
+                            # Feedback Queue Depth
+                            with ui.row().classes('w-full justify-between items-center bg-white p-2 rounded shadow-sm'):
+                                ui.label('Feedback Queue Depth').classes('text-xs font-semibold text-gray-500 uppercase')
+                                ui.label().bind_text_from(self.dashboard_state, 'feedback_queue_depth').classes('text-lg font-bold text-emerald-600')
+
+                    ui.timer(2.0, lambda: update_dashboard_state(self.telemetry_service, self.dashboard_state))
+
+    def _on_strategy_change(self, e):
+        """Dynamically enable/disable the context payload input."""
+        # Because we used on_change, 'e' is now a ValueChangeEventArguments object 
+        # which safely possesses the 'value' attribute.
+        if e.value == 'context':
+            self.context_input.enable()
+        else:
+            self.context_input.disable()
 
     async def _telemetry_listener(self):
         """Background task running on the NiceGUI async loop to process Redis events."""
@@ -157,7 +236,7 @@ class CommandDashboard:
                 
                 elif channel == "isomutator:telemetry:system":
                     if data.get("command") == "POISON_PILL":
-                        self.system_log.push("[SYSTEM] Poison pill received. Workers shutting down.")
+                        self.wiretap_log.push("[SYSTEM] Poison pill received. Workers shutting down.")
 
     def action_start_wargame(self):
         # 1. Update Singleton State
@@ -170,11 +249,12 @@ class CommandDashboard:
 
         # 2. Lock UI
         self.btn_start.disable()
+        self.btn_reconnect.disable()
         self.btn_stop.enable()
         self.target_input.disable()
         self.strategy_select.disable()
         
-        self.system_log.push(f"[SYSTEM] Wargame Initialized. Spawning {settings.striker_count} Strikers and {settings.judge_count} Judges...")
+        self.wiretap_log.push(f"[SYSTEM] Wargame Initialized. Spawning {settings.striker_count} Strikers and {settings.judge_count} Judges...")
 
         # 3. Strategy Factory
         strategy_choice = self.strategy_select.value
@@ -194,8 +274,9 @@ class CommandDashboard:
         self.telemetry_queue = QueueManager(queue_name="telemetry")
 
         self.telemetry_task = asyncio.create_task(self._telemetry_listener())
+        self.task_watcher.watch(self.telemetry_task, "TelemetryListener")
 
-        # --- LOGGING FIX: Initialize the QueueListener ---
+        # --- Initialize the QueueListener ---
         os.makedirs("logs", exist_ok=True)
         file_handler = logging.FileHandler("logs/isomutator.log", mode="w")
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
@@ -231,24 +312,108 @@ class CommandDashboard:
         for worker in self.workers:
             worker.start()
 
-    async def action_stop_wargame(self):
-        self.btn_stop.disable()
-        self.btn_start.enable()
-        self.target_input.enable()
-        self.strategy_select.enable()
+    async def action_reconnect_wargame(self):
+        """
+        Safely attempts to reconnect the UI to a currently running wargame via Redis.
+        Strictly avoids spawning new worker processes.
+        """
+        self.btn_start.disable()
+        self.btn_reconnect.disable()
+        self.target_input.disable()
+        self.strategy_select.disable()
 
-        self.system_log.push("[SYSTEM] Sending Poison Pill to all distributed workers...")
-        await self.telemetry_queue.send_poison_pill()
-        
-        if self.telemetry_task:
-            self.telemetry_task.cancel()
+        try:
+            # 1. Attempt to instantiate the broker connection
+            self.telemetry_queue = QueueManager(queue_name="telemetry")
             
-        # Safely shut down the file logger
-        if hasattr(self, 'log_listener'):
-            self.log_listener.stop()
+            # If the broker is unreachable, this will throw an error before we alter the UI state further
+            await self.telemetry_queue.ping_broker()
+            self.telemetry_service = TelemetryService(queue_manager=self.telemetry_queue)
+            
+            # 2. Cancel any orphaned telemetry tasks before creating a new one
+            if self.telemetry_task:
+                self.telemetry_task.cancel()
+                
+            self.telemetry_task = asyncio.create_task(self._telemetry_listener())
+            self.task_watcher.watch(self.telemetry_task, "TelemetryListener")
+            
+            # 3. Update UI state to "Active"
+            self.btn_stop.enable()
+            self.system_log.push("[SYSTEM] Reconnected to existing wargame telemetry.")
+            
+        except Exception as e:
+            # Error Handling: Fail gracefully, log the error, and unlock the UI
+            self.system_log.push("[ERROR] Failed to reconnect: Redis broker is offline.")
+            logger.error(f"UI Reconnection failed: {e}")
+            self.btn_start.enable()
+            self.btn_reconnect.enable()
+            self.btn_stop.disable()  
+            self.target_input.enable()
+            self.strategy_select.enable()
+
+    async def action_stop_wargame(self):
+        """
+        Executes the massive teardown sequence (The Poison Pill).
+        Gracefully shuts down remote workers via Redis, cancels local telemetry 
+        listeners, and ruthlessly terminates any hung OS processes.
+        """
+        # 1. Lock the STOP button to prevent idempotent double-clicks
+        self.btn_stop.disable()
+
+        # 2. Idempotency Check: Are we already stopped?
+        if not getattr(self, 'workers', []) and not getattr(self, 'telemetry_task', None):
+            self._unlock_ui_post_stop()
+            return
+
+        self.system_log.push("[SYSTEM] Initiating wargame teardown sequence...")
+
+        # 3. Broadcast the Poison Pill via the Message Broker
+        if getattr(self, 'control_queue', None):
+            try:
+                import redis.exceptions
+                await self.control_queue.publish("wargame:control", {"command": "STOP"})
+            except redis.exceptions.ConnectionError as e:
+                # Error Handling: If Redis drops, we must still kill local processes
+                logger.error(f"Failed to broadcast Poison Pill: {e}")
+                self.system_log.push("[ERROR] Broker offline. Forcing local termination.")
+
+        # 4. Cancel the background UI telemetry listener
+        if getattr(self, 'telemetry_task', None):
+            self.telemetry_task.cancel()
+            self.telemetry_task = None
+
+        # 5. Graceful Join & Ruthless Termination (Timeout & Latency Protocol)
+        for worker in getattr(self, 'workers', []):
+            if worker.is_alive():
+                # Give the worker 3 seconds to finish its current HTTP request and die cleanly
+                worker.join(timeout=3.0)
+                
+                # If the worker is STILL alive, it hung. Terminate it violently.
+                if worker.is_alive():
+                    logger.warning(f"Worker {worker.name} hung during shutdown. Forcefully terminating.")
+                    worker.terminate()
+                    worker.join(timeout=1.0) # Ensure the OS cleans up the zombie process
+
+        # 6. Clear state
+        if hasattr(self, 'workers'):
+            self.workers.clear()
+        
+        # 7. Final UI Reset
+        self.system_log.push("[SYSTEM] Wargame successfully terminated.")
+        self._unlock_ui_post_stop()
+
+    def _unlock_ui_post_stop(self):
+        """Helper method to safely reset all UI inputs to their default ready state."""
+        self.btn_start.enable()
+        if hasattr(self, 'btn_reconnect'):
+            self.btn_reconnect.enable()
+        if hasattr(self, 'target_input'):
+            self.target_input.enable()
+        if hasattr(self, 'strategy_select'):
+            self.strategy_select.enable()
 
     async def action_emergency_flush(self):
-        self.system_log.push("[ALERT] Emergency Flush Triggered!")
+        self.wiretap_log.push("[ALERT] Emergency Flush Triggered!")
         await self.action_stop_wargame()
         # Connect safely to perform the flush
         temp_queue = QueueManager(queue_name="temp")
@@ -257,5 +422,6 @@ class CommandDashboard:
 
 
 # Launch the UI
-dashboard = CommandDashboard()
-ui.run(title="IsoMutator Command Center", port=8080, dark=True)
+if __name__ in {"__main__", "__mp_main__"}:
+    dashboard = CommandDashboard()
+    ui.run(title="IsoMutator Command Center", port=8080, dark=True)

@@ -109,3 +109,50 @@ class QueueManager:
         # (Make sure these connection parameters match what you have in your __init__ method!)
         import redis.asyncio as redis
         self._redis = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+
+        """
+        Algorithm Summary (New Polling Methods):
+        The get_queue_depth method executes an asynchronous LLEN command against the Redis broker 
+        to determine the exact integer count of items currently waiting in the specified list.
+        The ping_broker method executes an asynchronous PING command to verify the socket connection 
+        is active and responsive, raising a ConnectionError if the broker is dead.
+        Both methods are designed to be called by the TelemetryService, which will handle any exceptions gracefully and provide fallback values to the UI.
+        """
+
+    async def ping_broker(self) -> bool:
+        """
+        Pings the underlying Redis broker to ensure the connection is alive.
+        
+        Returns:
+            bool: True if connected and responsive.
+            
+        Raises:
+            ConnectionError: If the Redis instance is unreachable or offline.
+        """
+        self.logger.trace("Entering ping_broker algorithm.")
+        
+        # _redis is the async Redis client initialized in the QueueManager
+        await self._redis.ping()
+        
+        self.logger.debug("Redis broker successfully pinged.")
+        return True
+
+    async def get_queue_depth(self, queue_name: str) -> int:
+        """
+        Retrieves the current number of items in a given queue.
+        
+        Args:
+            queue_name (str): The logical name of the queue (e.g., 'attack' or 'feedback').
+            
+        Returns:
+            int: The current integer length of the Redis list.
+        """
+        self.logger.trace(f"Entering get_queue_depth algorithm for queue: {queue_name}.")
+        
+        # Reconstruct the precise Redis key using the explicit project namespace
+        full_queue_name = f"isomutator:queue:{queue_name}"
+        
+        depth = await self._redis.llen(full_queue_name)
+        
+        self.logger.debug(f"Queue '{full_queue_name}' depth evaluated to {depth}.")
+        return depth

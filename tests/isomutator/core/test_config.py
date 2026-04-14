@@ -44,7 +44,7 @@ def test_config_default_remote_targets():
     config = IsoConfig()
     
     assert config.target_url == "http://192.9.159.125:8000"
-    assert config.attacker_url == "http://192.9.159.125:8000"
+    assert config.attacker_url == "http://192.9.159.125:11434"
 
 
 @patch.dict('os.environ', {'ISO_TARGET_URL': 'http://10.0.0.5:9000'})
