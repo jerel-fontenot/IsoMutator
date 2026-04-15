@@ -32,7 +32,7 @@ def dashboard(mock_ui_elements):
         dash.btn_reconnect = MagicMock()
         dash.target_input = MagicMock()      
         dash.strategy_select = MagicMock()
-        dash.system_log = MagicMock()
+        dash.wiretap_log = MagicMock()
         dash.telemetry_task = None
         dash.workers = []
         return dash
@@ -72,7 +72,7 @@ class TestCommandDashboardReconnect:
         # CRITICAL: No workers should be spawned
         mock_process.assert_not_called()
         assert len(dashboard.workers) == 0
-        dashboard.system_log.push.assert_called_with("[SYSTEM] Reconnected to existing wargame telemetry.")
+        dashboard.wiretap_log.push.assert_called_with("[SYSTEM] Reconnected to existing wargame telemetry.")
 
     @patch('isomutator.ui.app.QueueManager')
     @patch('isomutator.ui.app.TelemetryService')
@@ -109,7 +109,7 @@ class TestCommandDashboardReconnect:
         await dashboard.action_reconnect_wargame()
 
         # Assert
-        dashboard.system_log.push.assert_called_with("[ERROR] Failed to reconnect: Redis broker is offline.")
+        dashboard.wiretap_log.push.assert_called_with("[ERROR] Failed to reconnect: Redis broker is offline.")
         dashboard.btn_start.enable.assert_called_once()
         dashboard.btn_reconnect.enable.assert_called_once()
         dashboard.btn_stop.disable.assert_called_once()

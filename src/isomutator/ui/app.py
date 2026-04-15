@@ -8,6 +8,7 @@ The NiceGUI-based Interactive Command Center for IsoMutator.
 """
 
 import os
+import aiofiles
 import json
 import asyncio
 import multiprocessing
@@ -22,6 +23,7 @@ from isomutator.core.queue_manager import QueueManager
 from isomutator.processors.striker import AsyncStriker
 from isomutator.processors.judge import RedTeamJudge
 from isomutator.core.telemetry_service import TelemetryService
+from isomutator.reporting.report_generator import ReportGenerator
 from isomutator.ingestors.mutator import PromptMutator, run_mutator_process
 from isomutator.core.task_watcher import TaskWatcher
 from isomutator.core.strategies import (
@@ -137,12 +139,15 @@ class CommandDashboard:
                 # Master Controls (Now including RECONNECT)
                 with ui.row().classes('w-full gap-2 mt-auto'):
                     self.btn_start = ui.button('START', color='positive', on_click=self.action_start_wargame).classes('flex-grow')
+
                     self.btn_reconnect = ui.button('RECONNECT', color='info', on_click=self.action_reconnect_wargame).classes('flex-grow')
                     
                     self.btn_stop = ui.button('STOP', color='negative', on_click=self.action_stop_wargame).classes('flex-grow')
                     self.btn_stop.disable() 
     
                     self.btn_flush = ui.button('FLUSH', color='warning', on_click=self.action_emergency_flush).classes('flex-grow')
+
+                    self.btn_export = ui.button('Export Report', on_click=self.action_export_report).classes('w-full mt-2 bg-purple-700 hover:bg-purple-600')
 
             # --- MAIN DASHBOARD (Telemetry) ---
             # Spans the remaining 9 columns, aggressively filling the right side of the screen
@@ -276,7 +281,7 @@ class CommandDashboard:
         self.telemetry_task = asyncio.create_task(self._telemetry_listener())
         self.task_watcher.watch(self.telemetry_task, "TelemetryListener")
 
-        # --- Initialize the QueueListener ---
+        # 5. Initialize the QueueListener for logging across processes
         os.makedirs("logs", exist_ok=True)
         file_handler = logging.FileHandler("logs/isomutator.log", mode="w")
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
@@ -285,30 +290,43 @@ class CommandDashboard:
         self.log_listener = QueueListener(log_queue, file_handler)
         self.log_listener.start()
 
-        # 5. Spawn Horizontal Workers
+        # 6. Spawn Horizontal Workers
         self.workers = []
 
-        # Spin up N Strikers
+        # 7. Spin up N Strikers
         for i in range(settings.striker_count):
             striker = AsyncStriker(self.attack_queue, self.eval_queue, log_queue, settings.target_url)
             striker.name = f"Worker-Striker-{i+1}"
             self.workers.append(striker)
 
-        # Spin up M Judges
+        # 8. Spin up M Judges
         for i in range(settings.judge_count):
             judge = RedTeamJudge(self.eval_queue, self.feedback_queue, log_queue, strategy)
             judge.name = f"Worker-Judge-{i+1}"
             self.workers.append(judge)
 
-        # --- MUTATOR FIX: Wrap it in a standard Process ---
-        mutator_process = multiprocessing.Process(
-            target=run_mutator_process, 
-            args=(self.attack_queue, self.feedback_queue, strategy)
-        )
-        mutator_process.name = "Worker-Mutator"
-        self.workers.append(mutator_process)
+        # 10. Fetch the selected strategy from the UI dropdown
+        strategy_name = self.strategy_select.value
         
-        # Start all cores
+        # 11. Branching logic to pick the correct Mutator Factory based on UI dropdown
+        if strategy_name == 'context':
+            from isomutator.ingestors.context_mutator import run_context_mutator_process
+            target_fn = run_context_mutator_process
+        else:
+            from isomutator.ingestors.mutator import run_mutator_process
+            target_fn = run_mutator_process
+
+        # 12. Spawn the process with THREE arguments
+        p_mutator = multiprocessing.Process(
+            target=target_fn,
+            args=(self.attack_queue, self.feedback_queue, strategy_name),
+            name="Worker-Mutator"
+        )
+        
+        # Only append to the list. Let the loop below handle the .start()
+        self.workers.append(p_mutator)
+        
+        # Start all cores simultaneously
         for worker in self.workers:
             worker.start()
 
@@ -339,11 +357,11 @@ class CommandDashboard:
             
             # 3. Update UI state to "Active"
             self.btn_stop.enable()
-            self.system_log.push("[SYSTEM] Reconnected to existing wargame telemetry.")
+            self.wiretap_log.push("[SYSTEM] Reconnected to existing wargame telemetry.")
             
         except Exception as e:
             # Error Handling: Fail gracefully, log the error, and unlock the UI
-            self.system_log.push("[ERROR] Failed to reconnect: Redis broker is offline.")
+            self.wiretap_log.push("[ERROR] Failed to reconnect: Redis broker is offline.")
             logger.error(f"UI Reconnection failed: {e}")
             self.btn_start.enable()
             self.btn_reconnect.enable()
@@ -365,7 +383,7 @@ class CommandDashboard:
             self._unlock_ui_post_stop()
             return
 
-        self.system_log.push("[SYSTEM] Initiating wargame teardown sequence...")
+        self.wiretap_log.push("[SYSTEM] Initiating wargame teardown sequence...")
 
         # 3. Broadcast the Poison Pill via the Message Broker
         if getattr(self, 'control_queue', None):
@@ -375,7 +393,7 @@ class CommandDashboard:
             except redis.exceptions.ConnectionError as e:
                 # Error Handling: If Redis drops, we must still kill local processes
                 logger.error(f"Failed to broadcast Poison Pill: {e}")
-                self.system_log.push("[ERROR] Broker offline. Forcing local termination.")
+                self.wiretap_log.push("[ERROR] Broker offline. Forcing local termination.")
 
         # 4. Cancel the background UI telemetry listener
         if getattr(self, 'telemetry_task', None):
@@ -399,7 +417,7 @@ class CommandDashboard:
             self.workers.clear()
         
         # 7. Final UI Reset
-        self.system_log.push("[SYSTEM] Wargame successfully terminated.")
+        self.wiretap_log.push("[SYSTEM] Wargame successfully terminated.")
         self._unlock_ui_post_stop()
 
     def _unlock_ui_post_stop(self):
@@ -419,6 +437,53 @@ class CommandDashboard:
         temp_queue = QueueManager(queue_name="temp")
         await temp_queue._redis.flushdb()
         await temp_queue.close()
+
+    async def action_export_report(self):
+        """
+        Asynchronously parses the wargame ledger and exports the polymorphic 
+        JSON and HTML reports without blocking the NiceGUI event loop.
+        """
+        self.btn_export.disable()
+        self.wiretap_log.push("[SYSTEM] Generating forensic wargame reports...")
+        
+        try:
+            # 1. Initialize the Generator
+            generator = ReportGenerator()
+            ledger_path = "vulnerabilities.jsonl"
+            
+            # 2. Ensure the export directory exists
+            export_dir = "reports"
+            os.makedirs(export_dir, exist_ok=True)
+            
+            # 3. Generate Polymorphic Reports
+            html_content = await generator.generate_report(ledger_path, "html")
+            json_content = await generator.generate_report(ledger_path, "json")
+            
+            # 4. Safely write to disk
+            html_path = os.path.join(export_dir, "wargame_report.html")
+            json_path = os.path.join(export_dir, "wargame_report.json")
+            
+            async with aiofiles.open(html_path, "w", encoding="utf-8") as f:
+                await f.write(html_content)
+                
+            async with aiofiles.open(json_path, "w", encoding="utf-8") as f:
+                await f.write(json_content)
+                
+            # 5. UI Feedback & Automatic Download
+            self.wiretap_log.push(f"[SYSTEM] Reports successfully exported to /{export_dir}")
+            ui.notify("Reports generated successfully!", type="positive")
+            
+            # NiceGUI will automatically prompt the browser to download the file
+            ui.download(html_path)
+            
+        except FileNotFoundError:
+            self.wiretap_log.push("[ERROR] No ledger found. Run a wargame first.")
+            ui.notify("Ledger not found.", type="warning")
+        except Exception as e:
+            self.wiretap_log.push(f"[ERROR] Report generation failed: {str(e)}")
+            ui.notify("Failed to generate report.", type="negative")
+        finally:
+            self.btn_export.enable()
 
 
 # Launch the UI

@@ -30,7 +30,7 @@ from isomutator.ingestors.mutator import PromptMutator
 from isomutator.ingestors.context_mutator import ContextMutator
 from isomutator.processors.striker import AsyncStriker
 from isomutator.processors.judge import RedTeamJudge
-from isomutator.ui.dashboard import DashboardManager
+from isomutator.ui.app import CommandDashboard as DashboardManager
 from isomutator.reporting.reporter import VulnerabilityReporter
 from isomutator.core.strategies import (
     JailbreakStrategy,

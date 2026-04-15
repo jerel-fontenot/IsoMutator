@@ -26,7 +26,7 @@ class IsoConfig(BaseSettings):
     target_url: str = "http://192.9.159.125:8000"
     
     # Attacker LLM Settings
-    attacker_url: str = "http://192.9.159.125:11434"
+    attacker_url: str = "http://147.224.35.248:11434"
     attacker_api_type: str = "ollama"
     attacker_model: str = "llama3.2"
 

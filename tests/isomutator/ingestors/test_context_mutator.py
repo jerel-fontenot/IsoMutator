@@ -47,7 +47,8 @@ def mock_llm_client():
 async def context_mutator(mock_queue_manager, mock_llm_client):
     """Provides an isolated ContextMutator instance with mocked infrastructure."""
     mutator_instance = ContextMutator(
-        queue_manager=mock_queue_manager,
+        attack_queue=mock_queue_manager,
+        feedback_queue=mock_queue_manager,
         strategy_name="financial_report",
         oracle_client=mock_llm_client
     )
@@ -138,7 +139,7 @@ class TestContextMutator:
         mock_file = AsyncMock()
         mock_aiofiles.return_value.__aenter__.return_value = mock_file
     
-        # FIX: Use a reliable state counter instead of fragile string parsing
+        # Use a reliable state counter instead of fragile string parsing
         counter = 0
         async def mock_generate_json(session, messages, **kwargs):
             nonlocal counter

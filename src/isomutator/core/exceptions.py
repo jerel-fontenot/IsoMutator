@@ -41,3 +41,7 @@ class BrokerConnectionError(IsoMutatorError):
     unreachable during telemetry dispatch or teardown sequences.
     """
     pass
+
+class ReportingError(Exception):
+    """Raised when the ReportGenerator fails to parse telemetry or export data."""
+    pass

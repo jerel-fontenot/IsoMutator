@@ -34,7 +34,7 @@ def dashboard_ui():
         dash.btn_reconnect = MagicMock()
         dash.target_input = MagicMock()
         dash.strategy_select = MagicMock()
-        dash.system_log = MagicMock()
+        dash.wiretap_log = MagicMock()
         
         # We also mock the control queue where the Poison Pill is sent
         dash.control_queue = MagicMock()
@@ -75,7 +75,7 @@ class TestCommandDashboardStopSequence:
         dashboard_ui.btn_start.enable.assert_called_once()
         dashboard_ui.btn_reconnect.enable.assert_called_once()
         dashboard_ui.target_input.enable.assert_called_once()
-        dashboard_ui.system_log.push.assert_called_with("[SYSTEM] Wargame successfully terminated.")
+        dashboard_ui.wiretap_log.push.assert_called_with("[SYSTEM] Wargame successfully terminated.")
         
         # Workers list should be cleared
         assert len(dashboard_ui.workers) == 0

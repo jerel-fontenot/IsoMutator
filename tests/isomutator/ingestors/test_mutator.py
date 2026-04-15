@@ -47,7 +47,8 @@ async def mutator(mock_queue_manager, mock_llm_client):
     """Provides an isolated PromptMutator instance with mocked infrastructure."""
     # We inject the queue_manager to satisfy base.py, and the mock client for testing
     mutator_instance = PromptMutator(
-        queue_manager=mock_queue_manager,
+        attack_queue=mock_queue_manager,
+        feedback_queue=mock_queue_manager,
         strategy_name="context",
         oracle_client=mock_llm_client
     )

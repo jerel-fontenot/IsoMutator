@@ -19,8 +19,9 @@ def test_mutator_dependency_injection_ollama(mock_queue_manager):
     explicit_client = OllamaClient("http://localhost:11434", "llama3")
     
     mutator = PromptMutator(
-        queue_manager=mock_queue_manager, 
-        strategy_name="jailbreak", 
+        attack_queue=mock_queue_manager,
+        feedback_queue=mock_queue_manager,
+        strategy_name="jailbreak",
         oracle_client=explicit_client
     )
     
@@ -32,8 +33,9 @@ def test_mutator_dependency_injection_openai(mock_queue_manager):
     explicit_client = OpenAIClient("http://localhost:8000", "vllm-model")
     
     mutator = PromptMutator(
-        queue_manager=mock_queue_manager, 
-        strategy_name="context", 
+        attack_queue=mock_queue_manager,
+        feedback_queue=mock_queue_manager,
+        strategy_name="jailbreak",
         oracle_client=explicit_client
     )
     
