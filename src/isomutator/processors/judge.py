@@ -97,9 +97,20 @@ class RedTeamJudge(multiprocessing.Process):
             self.log_queue.close()
 
     async def _run_with_cleanup(self):
+        loop_task = asyncio.create_task(self._judge_loop())
+
+        async def _shutdown_watcher():
+            while not (self.shutdown_event and self.shutdown_event.is_set()):
+                await asyncio.sleep(0.2)
+            loop_task.cancel()
+
+        watcher = asyncio.create_task(_shutdown_watcher())
         try:
-            await self._judge_loop()
+            await loop_task
+        except asyncio.CancelledError:
+            pass
         finally:
+            watcher.cancel()
             await self.eval_queue.close()
             await self.feedback_queue.close()
 

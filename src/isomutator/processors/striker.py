@@ -70,9 +70,23 @@ class AsyncStriker(multiprocessing.Process):
             self.log_queue.close()
 
     async def _run_with_cleanup(self):
+        loop_task = asyncio.create_task(self._strike_loop())
+
+        async def _shutdown_watcher():
+            # Polls the multiprocessing.Event every 200ms and cancels the
+            # loop task the moment it is set, interrupting any in-flight
+            # HTTP request immediately rather than waiting for its timeout.
+            while not (self.shutdown_event and self.shutdown_event.is_set()):
+                await asyncio.sleep(0.2)
+            loop_task.cancel()
+
+        watcher = asyncio.create_task(_shutdown_watcher())
         try:
-            await self._strike_loop()
+            await loop_task
+        except asyncio.CancelledError:
+            pass
         finally:
+            watcher.cancel()
             await self.attack_queue.close()
             await self.eval_queue.close()
 

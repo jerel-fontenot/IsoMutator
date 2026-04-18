@@ -201,34 +201,57 @@ class PromptMutator(BaseSource):
 
 
 def run_mutator_process(*, attack_queue, feedback_queue, strategy_name, shutdown_event=None):
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     attack_name = getattr(attack_queue, 'queue_name', 'attack')
     feedback_name = getattr(feedback_queue, 'queue_name', 'feedback')
 
-    async def _run():
+    async def _run_with_cleanup():
         local_attack_queue = QueueManager(queue_name=attack_name)
         local_feedback_queue = QueueManager(queue_name=feedback_name)
+
+        async def _work():
+            try:
+                config = IsoConfig()
+                oracle_client = LLMClientFactory.create(
+                    api_type=config.attacker_api_type,
+                    url=config.attacker_url,
+                    model=config.attacker_model
+                )
+                mutator = PromptMutator(
+                    attack_queue=local_attack_queue,
+                    feedback_queue=local_feedback_queue,
+                    strategy_name=strategy_name,
+                    oracle_client=oracle_client,
+                    shutdown_event=shutdown_event
+                )
+                await mutator.listen()
+            finally:
+                print("[SYSTEM] Mutator initiating resource teardown...")
+                await local_attack_queue.close()
+                await local_feedback_queue.close()
+                print("[SYSTEM] Mutator resources released.")
+
+        # Shutdown watcher: cancels the work task within 200ms of kill switch being set.
+        # Without this, the mutator blocks inside the 30s Oracle LLM asyncio.wait_for
+        # and doesn't notice the shutdown_event until the LLM call completes.
+        work_task = asyncio.create_task(_work())
+
+        async def _shutdown_watcher():
+            while not (shutdown_event and shutdown_event.is_set()):
+                await asyncio.sleep(0.2)
+            work_task.cancel()
+
+        watcher = asyncio.create_task(_shutdown_watcher())
         try:
-            config = IsoConfig()
-            oracle_client = LLMClientFactory.create(
-                api_type=config.attacker_api_type,
-                url=config.attacker_url,
-                model=config.attacker_model
-            )
-            mutator = PromptMutator(
-                attack_queue=local_attack_queue,
-                feedback_queue=local_feedback_queue,
-                strategy_name=strategy_name,
-                oracle_client=oracle_client,
-                shutdown_event=shutdown_event
-            )
-            await mutator.listen()
+            await work_task
+        except asyncio.CancelledError:
+            pass
         finally:
-            print("[SYSTEM] Mutator initiating resource teardown...")
-            await local_attack_queue.close()
-            await local_feedback_queue.close()
-            print("[SYSTEM] Mutator resources released.")
+            watcher.cancel()
 
     try:
-        asyncio.run(_run())
+        asyncio.run(_run_with_cleanup())
     except Exception as e:
         logging.error(f"[CRITICAL] Mutator Process Crashed: {e}")

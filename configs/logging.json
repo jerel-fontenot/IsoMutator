@@ -19,7 +19,7 @@
         },
         "rolling_file": {
             "class": "logging.handlers.RotatingFileHandler",
-            "level": "DEBUG",
+            "level": "TRACE",
             "formatter": "detailed",
             "filename": "logs/isomutator.log",
             "maxBytes": 10485760,
@@ -33,11 +33,11 @@
     },
     "loggers": {
         "isomutator.ingest": {
-            "level": "DEBUG",
+            "level": "TRACE",
             "propagate": true
         },
         "isomutator.brain": {
-            "level": "DEBUG",
+            "level": "TRACE",
             "propagate": true
         }
     }

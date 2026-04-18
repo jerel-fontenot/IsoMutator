@@ -147,13 +147,15 @@ class CommandDashboard:
                     self.btn_start = ui.button('START', color='positive', on_click=self.action_start_wargame).classes('flex-grow')
 
                     self.btn_reconnect = ui.button('RECONNECT', color='info', on_click=self.action_reconnect_wargame).classes('flex-grow')
-                    
+
                     self.btn_stop = ui.button('STOP', color='negative', on_click=self.action_stop_wargame).classes('flex-grow')
-                    self.btn_stop.disable() 
-    
+                    self.btn_stop.disable()
+
                     self.btn_flush = ui.button('FLUSH', color='warning', on_click=self.action_emergency_flush).classes('flex-grow')
 
                     self.btn_export = ui.button('Export Report', on_click=self.action_export_report).classes('w-full mt-2 bg-purple-700 hover:bg-purple-600')
+
+                    self.btn_exit = ui.button('EXIT', color='negative', on_click=self.action_exit_app).classes('w-full mt-1 opacity-70')
 
                 self.broker_warning = ui.label('').classes('text-xs text-orange-500 w-full text-center mt-1')
 
@@ -254,30 +256,53 @@ class CommandDashboard:
         await pubsub.subscribe("isomutator:telemetry:ledger")
         await pubsub.subscribe("isomutator:telemetry:system")
 
-        async for message in pubsub.listen():
-            if message["type"] == "message":
+        while True:
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
+            if message and message["type"] == "message":
                 channel = message["channel"]
                 data = json.loads(message["data"])
 
                 if channel == "isomutator:telemetry:wiretap":
                     self.wiretap_log.push(f"[Turn {data.get('turn')}] Attacker: {data.get('attacker')}")
                     self.wiretap_log.push(f"[Turn {data.get('turn')}] Target:   {data.get('target')}\n")
-                
+
                 elif channel == "isomutator:telemetry:ledger":
                     new_row = {
-                        'turn': data.get('turn'), 
-                        'id': data.get('packet_id', '')[:8], 
+                        'turn': data.get('turn'),
+                        'id': data.get('packet_id', '')[:8],
                         'strategy': data.get('strategy')
                     }
                     self.ledger_table.rows.append(new_row)
                     self.ledger_table.update()
-                
+
                 elif channel == "isomutator:telemetry:system":
                     if data.get("command") == "POISON_PILL":
                         self.wiretap_log.push("[SYSTEM] Poison pill received. Workers shutting down.")
 
+            if self.shutdown_event.is_set():
+                break
+
+            await asyncio.sleep(0.05)
+
+        # Close the pub/sub StreamWriter synchronously. await pubsub.unsubscribe() calls
+        # parse_response(block=True) with no timeout, which hangs in uvloop. writer.close()
+        # schedules the transport close via libuv without blocking.
+        try:
+            conn = pubsub.connection
+            writer = getattr(conn, '_writer', None) if conn else None
+            if writer and not writer.is_closing():
+                writer.close()
+        except Exception:
+            pass
+
     def action_start_wargame(self):
+        # Restart the log listener if it was stopped by a previous wargame teardown.
+        self._log_manager.start()
+
         # 1. Update Singleton State
+        # Create a fresh Event each run — the previous one may still be set
+        # from the last stop, which would cause workers to exit immediately.
+        self.shutdown_event = multiprocessing.Event()
         settings.target_url = self.target_input.value
         settings.batch_size = int(self.batch_slider.value)
         settings.ping_pong_delay = float(self.ping_slider.value)
@@ -405,53 +430,62 @@ class CommandDashboard:
             self.strategy_select.enable()
 
     async def action_stop_wargame(self):
-        """
-        Executes the massive teardown sequence (The Poison Pill).
-        Gracefully shuts down remote workers via Redis, cancels local telemetry 
-        listeners, and ruthlessly terminates any hung OS processes.
-        """
-        # 1. Lock the STOP button to prevent idempotent double-clicks
+        """Signals all workers to stop, waits for clean exit, then releases resources."""
         self.btn_stop.disable()
 
-        # 2. Idempotency Check: Are we already stopped?
         if not getattr(self, 'workers', []) and not getattr(self, 'telemetry_task', None):
             self._unlock_ui_post_stop()
             return
 
         self.wiretap_log.push("[SYSTEM] Initiating wargame teardown sequence...")
+        self.shutdown_event.set()
 
-        # 3. Broadcast the Poison Pill via the Message Broker
-        if self.control_queue is not None:
-            try:
-                await self.control_queue.broadcast_telemetry(event_type="system", data={"command": "STOP"})
-            except redis.exceptions.ConnectionError as e:
-                # Error Handling: If Redis drops, we must still kill local processes
-                logger.error(f"Failed to broadcast Poison Pill: {e}")
-                self.wiretap_log.push("[ERROR] Broker offline. Forcing local termination.")
-
-        # 4. Cancel the background UI telemetry listener
+        # Wait for the telemetry listener to detect shutdown_event (polls every 50 ms)
+        # and call writer.close() on the pub/sub socket before we proceed.
+        # 0.6 s covers one full get_message cycle (0.5 s timeout) plus overhead.
         if self.telemetry_task is not None:
-            self.telemetry_task.cancel()
+            await asyncio.sleep(0.6)
+            if not self.telemetry_task.done():
+                self.telemetry_task.cancel()
             self.telemetry_task = None
 
-        # 5. Graceful Join & Ruthless Termination (Timeout & Latency Protocol)
-        self.shutdown_event.set()
-        for worker in getattr(self, 'workers', []):
-            if worker.is_alive():
-                # Give the worker 3 seconds to finish its current HTTP request and die cleanly
-                await asyncio.to_thread(worker.join, timeout=3.0)
-                
-                # If the worker is STILL alive, it hung. Terminate it violently.
-                if worker.is_alive():
-                    logger.warning(f"Worker {worker.name} hung during shutdown. Forcefully terminating.")
-                    worker.terminate()
-                    worker.join(timeout=1.0) # Ensure the OS cleans up the zombie process
+        # Poll for worker exit. Workers with shutdown watchers respond within ~200 ms.
+        workers = list(getattr(self, 'workers', []))
+        if workers:
+            for _ in range(20):  # 4-second grace period
+                await asyncio.sleep(0.2)
+                if not any(w.is_alive() for w in workers):
+                    break
 
-        # 6. Clear state
+            for w in workers:
+                if w.is_alive():
+                    logger.warning(f"Worker {w.name} did not exit cleanly. Sending SIGKILL.")
+                    w.kill()
+
+            if any(w.is_alive() for w in workers):
+                await asyncio.sleep(0.5)
+
+            # join() removes each process from multiprocessing._children, triggering
+            # semaphore cleanup. poll() already reaped the zombie so this returns instantly.
+            for w in workers:
+                w.join(timeout=1)
+
+        # Stop the log listener thread so it exits cleanly rather than blocking on Queue.get().
+        self._log_manager.stop()
+
+        # Close wargame Redis connections to remove their FDs from uvloop's epoll monitor.
+        for qm_attr in ('attack_queue', 'eval_queue', 'feedback_queue', 'telemetry_queue'):
+            qm = getattr(self, qm_attr, None)
+            if qm is not None:
+                try:
+                    await asyncio.wait_for(qm.close(), timeout=1.0)
+                except Exception:
+                    pass
+                setattr(self, qm_attr, None)
+
         if hasattr(self, 'workers'):
             self.workers.clear()
-        
-        # 7. Final UI Reset
+
         self.wiretap_log.push("[SYSTEM] Wargame successfully terminated.")
         self._unlock_ui_post_stop()
 
@@ -464,6 +498,16 @@ class CommandDashboard:
             self.target_input.enable()
         if hasattr(self, 'strategy_select'):
             self.strategy_select.enable()
+
+    async def action_exit_app(self):
+        """Stops the wargame (if running), closes the browser window, then shuts down the server."""
+        if getattr(self, 'workers', []) or getattr(self, 'telemetry_task', None):
+            await self.action_stop_wargame()
+        try:
+            await ui.run_javascript('window.close()')
+        except Exception:
+            pass
+        app.shutdown()
 
     async def action_emergency_flush(self):
         self.wiretap_log.push("[ALERT] Emergency Flush Triggered!")
@@ -520,4 +564,18 @@ class CommandDashboard:
 # Launch the UI
 if __name__ in {"__main__", "__mp_main__"}:
     dashboard = CommandDashboard()
+
+    # Close the always-on polling Redis connection when uvicorn shuts down.
+    # Without this, libuv keeps monitoring the open TCP handle during loop teardown,
+    # causing uvicorn to hang until Redis closes the idle connection from its side.
+    @app.on_shutdown
+    async def _close_polling_connection():
+        qm = getattr(dashboard, 'polling_qm', None)
+        if qm is not None:
+            dashboard.polling_qm = None  # guard against double-fire before await
+            try:
+                await asyncio.wait_for(qm.close(), timeout=2.0)
+            except Exception:
+                pass
+
     ui.run(title="IsoMutator Command Center", port=8080, dark=True, reload=False)
