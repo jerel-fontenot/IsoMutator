@@ -21,22 +21,11 @@ TECHNOLOGY QUIRKS:
 """
 
 import abc
-import logging
 import re
 
-# Establish TRACE level logging if it does not exist in the environment
-TRACE_LEVEL_NUM = 5
-if not hasattr(logging, "TRACE"):
-    logging.addLevelName(TRACE_LEVEL_NUM, "TRACE")
-    logging.TRACE = TRACE_LEVEL_NUM
+from isomutator.core.log_manager import LogManager
 
-def trace(self, message, *args, **kws):
-    """Allows logger.trace('message') calls across the codebase."""
-    if self.isEnabledFor(TRACE_LEVEL_NUM):
-        self._log(TRACE_LEVEL_NUM, message, args, **kws)
-
-logging.Logger.trace = trace
-logger = logging.getLogger("isomutator.brain.strategies")
+logger = LogManager.get_logger("isomutator.brain.strategies")
 
 
 class RedTeamStrategy(abc.ABC):

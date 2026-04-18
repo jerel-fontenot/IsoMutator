@@ -16,7 +16,7 @@ from isomutator.core.log_manager import LogManager
 from isomutator.models.packet import DataPacket
 
 class QueueManager:
-    def __init__(self, redis_url: str = "redis://localhost:6379/0", queue_name: str = "default"):
+    def __init__(self, *, redis_url: str = "redis://localhost:6379/0", queue_name: str = "default"):
         self.logger = LogManager.get_logger("isomutator.system")
         self.queue_name = queue_name
         self.queue_key = f"isomutator:queue:{queue_name}"
@@ -25,7 +25,7 @@ class QueueManager:
         self._redis = Redis.from_url(redis_url, decode_responses=True)
         self.logger.trace(f"QueueManager connected to Redis at {redis_url} (Queue: {self.queue_key})")
 
-    async def async_put(self, item: DataPacket, timeout: float = 0.5) -> bool:
+    async def async_put(self, *, item: DataPacket, timeout: float = 0.5) -> bool:
         """Pushes a serialized DataPacket onto the left side of the Redis List."""
         try:
             await self._redis.lpush(self.queue_key, item.to_json())
@@ -34,7 +34,7 @@ class QueueManager:
             self.logger.error(f"Redis LPUSH failed on {self.queue_key}: {e}")
             return False
 
-    async def get_batch(self, target_size: int = 32, max_wait: float = 1.0) -> list:
+    async def get_batch(self, *, target_size: int = 32, max_wait: float = 1.0) -> list:
         """
         Pulls a batch of packets. Blocks until at least ONE item is available, 
         then sweeps the rest instantly up to the target_size.
@@ -63,7 +63,7 @@ class QueueManager:
             
         return batch
 
-    async def broadcast_telemetry(self, event_type: str, data: dict):
+    async def broadcast_telemetry(self, *, event_type: str, data: dict):
         """Publishes transient state updates for the decoupled GUI to consume."""
         channel = f"isomutator:telemetry:{event_type}"
         try:
@@ -81,11 +81,11 @@ class QueueManager:
     async def send_poison_pill(self):
         """Broadcasts a global shutdown event."""
         self.logger.info("Broadcasting Poison Pill to all microservices...")
-        await self.broadcast_telemetry("system", {"command": "POISON_PILL"})
+        await self.broadcast_telemetry(event_type="system", data={"command": "POISON_PILL"})
 
     async def close(self):
         """Closes the Redis connection pool cleanly."""
-        await self._redis.aclose()
+        await self._redis.aclose()  # type: ignore[attr-defined]
         self.logger.trace(f"Redis connection pool closed for {self.queue_name}.")
 
     def __getstate__(self):
@@ -134,7 +134,7 @@ class QueueManager:
         # _redis is the async Redis client initialized in the QueueManager
         await self._redis.ping()
         
-        self.logger.debug("Redis broker successfully pinged.")
+        self.logger.trace("Redis broker successfully pinged.")
         return True
 
     async def get_queue_depth(self, queue_name: str) -> int:
@@ -154,5 +154,5 @@ class QueueManager:
         
         depth = await self._redis.llen(full_queue_name)
         
-        self.logger.debug(f"Queue '{full_queue_name}' depth evaluated to {depth}.")
+        self.logger.trace(f"Queue '{full_queue_name}' depth evaluated to {depth}.")
         return depth

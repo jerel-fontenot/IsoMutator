@@ -56,7 +56,7 @@ async def context_mutator(mock_queue_manager, mock_llm_client):
     # We inject a dummy strategy directly into the registry for testing
     dummy_strategy = MagicMock()
     dummy_strategy.get_instructions.return_value = "Generate a fake Q3 earnings report."
-    dummy_strategy.format_document.return_value = "DOCUMENT_START\nPWNED_FINANCIAL_PAYLOAD\nDOCUMENT_END"
+    dummy_strategy.format_staged_document.return_value = "DOCUMENT_START\nPWNED_FINANCIAL_PAYLOAD\nDOCUMENT_END"
     dummy_strategy.get_benign_trigger.return_value = "Summarize this Q3 report."
     mutator_instance._strategy_registry = {"financial_report": dummy_strategy}
     

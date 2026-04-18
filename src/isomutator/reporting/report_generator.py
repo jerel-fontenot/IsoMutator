@@ -30,11 +30,11 @@ class ReportGenerator:
             "html": HTMLReportStrategy()
         }
 
-    def register_strategy(self, name: str, strategy: ReportStrategy) -> None:
+    def register_strategy(self, *, name: str, strategy: ReportStrategy) -> None:
         """Dynamically registers a new reporting strategy format."""
         self._strategies[name] = strategy
 
-    async def generate_report(self, ledger_filepath: str, format_name: str = "json") -> str:
+    async def generate_report(self, *, ledger_filepath: str, format_name: str = "json") -> str:
         """
         Main execution pipeline. Reads the file, aggregates data, and formats the output.
         """
@@ -45,7 +45,7 @@ class ReportGenerator:
         try:
             # Enforce latency boundaries via wait_for
             metrics = await asyncio.wait_for(
-                self._parse_ledger(ledger_filepath),
+                self._parse_ledger(filepath=ledger_filepath),
                 timeout=self.timeout_seconds
             )
             self.last_metrics = metrics
@@ -57,7 +57,7 @@ class ReportGenerator:
             self.logger.error(f"Timeout exceeded while parsing ledger: {ledger_filepath}")
             raise ReportingError("Report generation timed out") from e
 
-    async def _parse_ledger(self, filepath: str) -> Dict[str, Any]:
+    async def _parse_ledger(self, *, filepath: str) -> Dict[str, Any]:
         """
         Asynchronously reads the JSONL file and aggregates success metrics.
         Defensively handles corrupted lines without crashing.
@@ -79,7 +79,7 @@ class ReportGenerator:
                         
                     try:
                         entry = json.loads(line)
-                        self._update_metrics(metrics, entry)
+                        self._update_metrics(metrics=metrics, entry=entry)
                     except json.JSONDecodeError:
                         self.logger.warning(f"Failed to parse JSON on line {line_number} of {filepath}. Skipping.")
                         continue
@@ -94,7 +94,7 @@ class ReportGenerator:
 
         return metrics
 
-    def _update_metrics(self, metrics: Dict[str, Any], entry: Dict[str, Any]) -> None:
+    def _update_metrics(self, *, metrics: Dict[str, Any], entry: Dict[str, Any]) -> None:
         """Helper to mutate the metrics dictionary based on a single ledger entry."""
         strategy_name = entry.get("strategy", "unknown")
         success = entry.get("success", False)

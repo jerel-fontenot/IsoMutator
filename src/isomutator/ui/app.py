@@ -4,22 +4,21 @@ The NiceGUI-based Interactive Command Center for IsoMutator.
 1. Layout: A CSS Grid splitting the screen into a Configuration Sidebar and a Telemetry Dashboard.
 2. Reactivity: Uses NiceGUI's `.on('change', ...)` to handle dynamic UI states.
 3. Horizontal Scaling: Spawns `N` Strikers and `M` Judges based on slider values, 
-   allowing Redis to automatically load-balance the queues.
+    allowing Redis to automatically load-balance the queues.
 """
 
-import os
 import aiofiles
 import json
 import asyncio
 import multiprocessing
-import logging
-from logging.handlers import QueueListener
+import redis.exceptions
 from typing import Dict, Any
 
 from nicegui import ui, app
 
 from isomutator.core.config import settings
 from isomutator.core.queue_manager import QueueManager
+from isomutator.core.log_manager import LogManager, IsoLogger
 from isomutator.processors.striker import AsyncStriker
 from isomutator.processors.judge import RedTeamJudge
 from isomutator.core.telemetry_service import TelemetryService
@@ -34,12 +33,7 @@ from isomutator.core.strategies import (
     LinuxPrivescStrategy
 )
 
-# Ensure TRACE level is defined per project specifications
-if not hasattr(logging, 'TRACE'):
-    logging.TRACE = 5
-    logging.addLevelName(logging.TRACE, 'TRACE')
-
-logger = logging.getLogger(__name__)
+logger: IsoLogger = LogManager.get_logger(__name__)
 
 """
 Algorithm Summary (Dashboard State Updater):
@@ -49,7 +43,7 @@ service for real-time pipeline metrics and safely mutates a centralized state di
 The UI components are reactively bound to this dictionary, allowing them to update 
 automatically without blocking the main event loop.
 """
-async def update_dashboard_state(telemetry_service: Any, ui_state: Dict[str, Any]) -> None:
+async def update_dashboard_state(*, telemetry_service: Any, ui_state: Dict[str, Any]) -> None:
     """
     Asynchronously fetches telemetry metrics and mutates the reactive UI state dictionary.
     
@@ -57,27 +51,39 @@ async def update_dashboard_state(telemetry_service: Any, ui_state: Dict[str, Any
         telemetry_service: The initialized TelemetryService instance.
         ui_state (dict): The dictionary bound to the NiceGUI frontend elements.
     """
-    logger.log(logging.TRACE, "Entering update_dashboard_state algorithm.")
-    
+    logger.trace("Entering update_dashboard_state algorithm.")
+
     # Fetch metrics safely from the backend service
     metrics = await telemetry_service.get_dashboard_metrics()
-    
+
     # Mutate the state dictionary (NiceGUI will automatically detect these changes)
     ui_state["broker_status"] = metrics.get("broker_status", "Unknown")
     ui_state["attack_queue_depth"] = metrics.get("attack_queue_depth", -1)
     ui_state["feedback_queue_depth"] = metrics.get("feedback_queue_depth", -1)
-    
-    logger.debug(f"UI state successfully updated with metrics: {metrics}")
-    logger.log(logging.TRACE, "Exiting update_dashboard_state algorithm.")
+
+    logger.trace(f"UI state successfully updated with metrics: {metrics}")
+    logger.trace("Exiting update_dashboard_state algorithm.")
 
 class CommandDashboard:
-    def __init__(self):
-        self.workers = []
-        self.telemetry_task = None
-        self.build_ui()
+    _instance = None
 
-        # Instantiate the Task Watcher
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if getattr(self, '_initialized', False):
+            return
+        self.workers: list = []
+        self.telemetry_task: asyncio.Task[None] | None = None
+        self.control_queue: QueueManager | None = None
+        self.shutdown_event = multiprocessing.Event()
+        self._log_manager = LogManager()
+        self._log_manager.start()
         self.task_watcher = TaskWatcher(logger=logger)
+        self.build_ui()
+        self._initialized = True
 
     def build_ui(self):
         ui.colors(primary='#2b2b2b', secondary='#4a4a4a', accent='#f39c12')
@@ -149,6 +155,8 @@ class CommandDashboard:
 
                     self.btn_export = ui.button('Export Report', on_click=self.action_export_report).classes('w-full mt-2 bg-purple-700 hover:bg-purple-600')
 
+                self.broker_warning = ui.label('').classes('text-xs text-orange-500 w-full text-center mt-1')
+
             # --- MAIN DASHBOARD (Telemetry) ---
             # Spans the remaining 9 columns, aggressively filling the right side of the screen
             self.telemetry_container = ui.column().classes('col-span-9 h-full gap-4 flex-nowrap')
@@ -203,16 +211,41 @@ class CommandDashboard:
                                 ui.label('Feedback Queue Depth').classes('text-xs font-semibold text-gray-500 uppercase')
                                 ui.label().bind_text_from(self.dashboard_state, 'feedback_queue_depth').classes('text-lg font-bold text-emerald-600')
 
-                    ui.timer(2.0, lambda: update_dashboard_state(self.telemetry_service, self.dashboard_state))
+                    async def ui_tick():
+                        await update_dashboard_state(
+                            telemetry_service=self.telemetry_service,
+                            ui_state=self.dashboard_state
+                        )
+                        self._sync_broker_state()
 
+                    async def startup_check():
+                        await update_dashboard_state(
+                            telemetry_service=self.telemetry_service,
+                            ui_state=self.dashboard_state
+                        )
+                        self._sync_broker_state()
+
+                    ui.timer(2.0, ui_tick)
+                    ui.timer(0.1, startup_check, once=True)
     def _on_strategy_change(self, e):
         """Dynamically enable/disable the context payload input."""
-        # Because we used on_change, 'e' is now a ValueChangeEventArguments object 
-        # which safely possesses the 'value' attribute.
         if e.value == 'context':
             self.context_input.enable()
         else:
             self.context_input.disable()
+
+    def _sync_broker_state(self):
+        """Enables or disables START based on live broker health; updates the warning label."""
+        is_online = self.dashboard_state.get("broker_status") == "Online"
+        wargame_active = bool(self.workers)
+        if is_online:
+            self.broker_warning.set_text("")
+            if not wargame_active:
+                self.btn_start.enable()
+        else:
+            self.broker_warning.set_text("Redis offline — START disabled")
+            if not wargame_active:
+                self.btn_start.disable()
 
     async def _telemetry_listener(self):
         """Background task running on the NiceGUI async loop to process Redis events."""
@@ -262,7 +295,7 @@ class CommandDashboard:
         self.wiretap_log.push(f"[SYSTEM] Wargame Initialized. Spawning {settings.striker_count} Strikers and {settings.judge_count} Judges...")
 
         # 3. Strategy Factory
-        strategy_choice = self.strategy_select.value
+        strategy_choice: str = self.strategy_select.value or "jailbreak"
         strategy_map = {
             "context": ContextInjectionStrategy,
             "obfuscation": ObfuscationStrategy,
@@ -279,36 +312,38 @@ class CommandDashboard:
         self.telemetry_queue = QueueManager(queue_name="telemetry")
 
         self.telemetry_task = asyncio.create_task(self._telemetry_listener())
-        self.task_watcher.watch(self.telemetry_task, "TelemetryListener")
+        self.task_watcher.watch(task=self.telemetry_task, name="TelemetryListener")
 
-        # 5. Initialize the QueueListener for logging across processes
-        os.makedirs("logs", exist_ok=True)
-        file_handler = logging.FileHandler("logs/isomutator.log", mode="w")
-        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-        log_queue = multiprocessing.Queue()
-        
-        self.log_listener = QueueListener(log_queue, file_handler)
-        self.log_listener.start()
-
-        # 6. Spawn Horizontal Workers
+        # 5. Spawn Horizontal Workers
         self.workers = []
 
-        # 7. Spin up N Strikers
+        # 6. Spin up N Strikers
         for i in range(settings.striker_count):
-            striker = AsyncStriker(self.attack_queue, self.eval_queue, log_queue, settings.target_url)
+            striker = AsyncStriker(
+                attack_queue=self.attack_queue,
+                eval_queue=self.eval_queue,
+                log_queue=self._log_manager.log_queue,
+                target_url=settings.target_url,
+                shutdown_event=self.shutdown_event
+            )
             striker.name = f"Worker-Striker-{i+1}"
             self.workers.append(striker)
 
-        # 8. Spin up M Judges
+        # 7. Spin up M Judges
         for i in range(settings.judge_count):
-            judge = RedTeamJudge(self.eval_queue, self.feedback_queue, log_queue, strategy)
+            judge = RedTeamJudge(
+                eval_queue=self.eval_queue,
+                feedback_queue=self.feedback_queue,
+                log_queue=self._log_manager.log_queue,
+                strategy=strategy,
+                shutdown_event=self.shutdown_event)
             judge.name = f"Worker-Judge-{i+1}"
             self.workers.append(judge)
 
-        # 10. Fetch the selected strategy from the UI dropdown
+        # 8. Fetch the selected strategy from the UI dropdown
         strategy_name = self.strategy_select.value
         
-        # 11. Branching logic to pick the correct Mutator Factory based on UI dropdown
+        # 9. Branching logic to pick the correct Mutator Factory based on UI dropdown
         if strategy_name == 'context':
             from isomutator.ingestors.context_mutator import run_context_mutator_process
             target_fn = run_context_mutator_process
@@ -316,10 +351,10 @@ class CommandDashboard:
             from isomutator.ingestors.mutator import run_mutator_process
             target_fn = run_mutator_process
 
-        # 12. Spawn the process with THREE arguments
+        # 10. Spawn the process using kwargs to match keyword-only function signatures
         p_mutator = multiprocessing.Process(
             target=target_fn,
-            args=(self.attack_queue, self.feedback_queue, strategy_name),
+            kwargs={"attack_queue": self.attack_queue, "feedback_queue": self.feedback_queue, "strategy_name": strategy_name, "shutdown_event": self.shutdown_event},
             name="Worker-Mutator"
         )
         
@@ -353,7 +388,7 @@ class CommandDashboard:
                 self.telemetry_task.cancel()
                 
             self.telemetry_task = asyncio.create_task(self._telemetry_listener())
-            self.task_watcher.watch(self.telemetry_task, "TelemetryListener")
+            self.task_watcher.watch(task=self.telemetry_task, name="TelemetryListener")
             
             # 3. Update UI state to "Active"
             self.btn_stop.enable()
@@ -386,25 +421,25 @@ class CommandDashboard:
         self.wiretap_log.push("[SYSTEM] Initiating wargame teardown sequence...")
 
         # 3. Broadcast the Poison Pill via the Message Broker
-        if getattr(self, 'control_queue', None):
+        if self.control_queue is not None:
             try:
-                import redis.exceptions
-                await self.control_queue.publish("wargame:control", {"command": "STOP"})
+                await self.control_queue.broadcast_telemetry(event_type="system", data={"command": "STOP"})
             except redis.exceptions.ConnectionError as e:
                 # Error Handling: If Redis drops, we must still kill local processes
                 logger.error(f"Failed to broadcast Poison Pill: {e}")
                 self.wiretap_log.push("[ERROR] Broker offline. Forcing local termination.")
 
         # 4. Cancel the background UI telemetry listener
-        if getattr(self, 'telemetry_task', None):
+        if self.telemetry_task is not None:
             self.telemetry_task.cancel()
             self.telemetry_task = None
 
         # 5. Graceful Join & Ruthless Termination (Timeout & Latency Protocol)
+        self.shutdown_event.set()
         for worker in getattr(self, 'workers', []):
             if worker.is_alive():
                 # Give the worker 3 seconds to finish its current HTTP request and die cleanly
-                worker.join(timeout=3.0)
+                await asyncio.to_thread(worker.join, timeout=3.0)
                 
                 # If the worker is STILL alive, it hung. Terminate it violently.
                 if worker.is_alive():
@@ -449,19 +484,15 @@ class CommandDashboard:
         try:
             # 1. Initialize the Generator
             generator = ReportGenerator()
-            ledger_path = "vulnerabilities.jsonl"
-            
-            # 2. Ensure the export directory exists
-            export_dir = "reports"
-            os.makedirs(export_dir, exist_ok=True)
-            
-            # 3. Generate Polymorphic Reports
-            html_content = await generator.generate_report(ledger_path, "html")
-            json_content = await generator.generate_report(ledger_path, "json")
-            
+            ledger_path = str(settings.ledger_file)
+
+            # 3. Generate Polymorphic Reports (reports_dir created by IsoConfig on startup)
+            html_content = await generator.generate_report(ledger_filepath=ledger_path, format_name="html")
+            json_content = await generator.generate_report(ledger_filepath=ledger_path, format_name="json")
+
             # 4. Safely write to disk
-            html_path = os.path.join(export_dir, "wargame_report.html")
-            json_path = os.path.join(export_dir, "wargame_report.json")
+            html_path = str(settings.reports_dir / "wargame_report.html")
+            json_path = str(settings.reports_dir / "wargame_report.json")
             
             async with aiofiles.open(html_path, "w", encoding="utf-8") as f:
                 await f.write(html_content)
@@ -470,7 +501,7 @@ class CommandDashboard:
                 await f.write(json_content)
                 
             # 5. UI Feedback & Automatic Download
-            self.wiretap_log.push(f"[SYSTEM] Reports successfully exported to /{export_dir}")
+            self.wiretap_log.push(f"[SYSTEM] Reports successfully exported to {settings.reports_dir}/")
             ui.notify("Reports generated successfully!", type="positive")
             
             # NiceGUI will automatically prompt the browser to download the file
@@ -489,4 +520,4 @@ class CommandDashboard:
 # Launch the UI
 if __name__ in {"__main__", "__mp_main__"}:
     dashboard = CommandDashboard()
-    ui.run(title="IsoMutator Command Center", port=8080, dark=True)
+    ui.run(title="IsoMutator Command Center", port=8080, dark=True, reload=False)

@@ -46,7 +46,7 @@ class TestDashboardStateUpdater:
         }
 
         # Act
-        await update_dashboard_state(mock_telemetry_service, initial_ui_state)
+        await update_dashboard_state(telemetry_service=mock_telemetry_service, ui_state=initial_ui_state)
 
         # Assert
         assert initial_ui_state["broker_status"] == "Online"
@@ -67,7 +67,7 @@ class TestDashboardStateUpdater:
         }
 
         # Act
-        await update_dashboard_state(mock_telemetry_service, initial_ui_state)
+        await update_dashboard_state(telemetry_service=mock_telemetry_service, ui_state=initial_ui_state)
 
         # Assert
         assert initial_ui_state["broker_status"] == "Offline"

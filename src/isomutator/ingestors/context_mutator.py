@@ -38,12 +38,12 @@ import aiofiles
 from isomutator.ingestors.base import BaseSource
 from isomutator.models.packet import DataPacket
 from isomutator.core.exceptions import MutationError, StrategyNotFoundError
-from isomutator.core.config import IsoConfig
+from isomutator.core.config import IsoConfig, settings
 from isomutator.ingestors.llm_client import LLMClientFactory
 
 # In a production environment, you would dynamically load these from your registry.
 # We import a base representation to satisfy the Factory Pattern.
-from isomutator.core.strategies import ContextInjectionStrategy
+from isomutator.core.strategies import ContextInjectionStrategy, FinancialReportContextStrategy
 
 class ContextMutator(BaseSource):
     """
@@ -52,7 +52,7 @@ class ContextMutator(BaseSource):
     and dispatches a benign conversational trigger to trick the Target AI.
     """
     
-    def __init__(self, attack_queue, feedback_queue, strategy_name: str, oracle_client):
+    def __init__(self, *, attack_queue, feedback_queue, strategy_name: str, oracle_client):
         super().__init__(queue_manager=attack_queue, name="ContextMutator")
         
         self.feedback_queue = feedback_queue
@@ -60,13 +60,12 @@ class ContextMutator(BaseSource):
         self.oracle_client = oracle_client
         self.timeout_seconds = 30.0
         
-        # Ensure the staging directory exists on the host machine
-        self.staging_dir = "staging"
-        os.makedirs(self.staging_dir, exist_ok=True)
+        # staging_dir is created at startup by IsoConfig.create_directories
+        self.staging_dir = str(settings.staging_dir)
         
-        # The Factory Registry.
-        # Note: We rely on the tests/strategies.py to populate actual behavior.
-        self._strategy_registry: Dict[str, Any] = {}
+        self._strategy_registry: Dict[str, Any] = {
+            "context": FinancialReportContextStrategy(),
+        }
 
     def _get_strategy(self, strategy_name: str) -> Any:
         """Dynamic Factory method for resolving Context/RAG Strategy objects."""
@@ -75,7 +74,7 @@ class ContextMutator(BaseSource):
             raise StrategyNotFoundError(f"Strategy '{strategy_name}' is not registered.")
         return strategy
 
-    async def stage_payload(self, base_goal: str, strategy_name: str = None) -> DataPacket:
+    async def stage_payload(self, base_goal: str, strategy_name: str | None = None) -> DataPacket | None:
         """
         The Dual-Stage Engine.
         Generates the attack, writes it to disk, and constructs the DataPacket.
@@ -95,7 +94,7 @@ class ContextMutator(BaseSource):
             '{"attacks": [{"strategy": "Name of strategy", "prompt": "The exact weaponized text"}]}'
         )
         
-        user_content = strategy.get_instructions(base_goal)
+        user_content = strategy.get_counter_attack_prompt(turn_count=1)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content}
@@ -127,7 +126,7 @@ class ContextMutator(BaseSource):
         raw_malicious_payload = attacks[0].get("prompt", "")
         
         # --- STAGE 2: Disk I/O & Formatting ---
-        formatted_document = strategy.format_document(raw_malicious_payload)
+        formatted_document = strategy.format_staged_document(raw_malicious_payload)
         file_path = os.path.join(self.staging_dir, f"staged_context_{uuid.uuid4().hex[:8]}.txt")
 
         try:
@@ -145,7 +144,8 @@ class ContextMutator(BaseSource):
         packet = DataPacket(
             raw_content=benign_trigger,
             source=f"context_mutator/{strat_name.replace(' ', '_').lower()}",
-            staged_payload=raw_malicious_payload, 
+            staged_payload=raw_malicious_payload,
+            staged_filename=os.path.basename(file_path),
             metadata={"original_goal": base_goal, "staged_file_path": file_path}
         )
         return packet
@@ -156,7 +156,7 @@ class ContextMutator(BaseSource):
         try:
             while True:
                 # MCTS BRANCHING: Check the Feedback Queue
-                feedback_batch = await self.feedback_queue.get_batch(1)
+                feedback_batch = await self.feedback_queue.get_batch(target_size=1)
                 feedback_packet = feedback_batch[0] if feedback_batch else None
                 
                 if feedback_packet:
@@ -187,7 +187,7 @@ class ContextMutator(BaseSource):
             await self.oracle_client.close()
             self.logger.debug("Oracle LLM client session gracefully closed.")
 
-def run_context_mutator_process(attack_queue, feedback_queue, strategy_name):
+def run_context_mutator_process(*, attack_queue, feedback_queue, strategy_name, shutdown_event=None):
     """Top-level function to safely spawn the ContextMutator in a new OS process."""
     from isomutator.core.config import IsoConfig
     from isomutator.ingestors.llm_client import LLMClientFactory
@@ -199,5 +199,5 @@ def run_context_mutator_process(attack_queue, feedback_queue, strategy_name):
         model=config.attacker_model
     )
     # Pass both queues safely
-    mutator = ContextMutator(attack_queue, feedback_queue, strategy_name, oracle_client)
+    mutator = ContextMutator(attack_queue=attack_queue, feedback_queue=feedback_queue, strategy_name=strategy_name, oracle_client=oracle_client)
     asyncio.run(mutator.listen())

@@ -31,4 +31,4 @@ class BaseSource(abc.ABC):
         Logs the trace automatically before attempting the asynchronous put.
         """
         self.logger.trace(packet.to_log_trace())
-        return await self.queue_manager.async_put(packet)
+        return await self.queue_manager.async_put(item=packet)

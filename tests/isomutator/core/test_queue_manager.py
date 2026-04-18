@@ -33,7 +33,7 @@ async def test_queue_manager_concurrency_spike(mock_redis_manager):
     # Arrange 1,000 concurrent packets
     async def simulated_put(idx):
         packet = DataPacket(raw_content=f"payload_{idx}", source="test")
-        return await qm.async_put(packet)
+        return await qm.async_put(item=packet)
         
     # Act: Fire all 1,000 requests simultaneously
     results = await asyncio.gather(*(simulated_put(i) for i in range(1000)))

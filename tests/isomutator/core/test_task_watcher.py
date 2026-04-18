@@ -48,7 +48,7 @@ class TestTaskWatcher:
         task = asyncio.create_task(successful_coroutine())
         
         with caplog.at_level(logging.TRACE, logger="test_task_watcher"):
-            task_watcher.watch(task, "TelemetryListener")
+            task_watcher.watch(task=task, name="TelemetryListener")
             result = await task
             await asyncio.sleep(0.01) # Yield loop for callback processing
 
@@ -69,7 +69,7 @@ class TestTaskWatcher:
         task = asyncio.create_task(infinite_coroutine())
         
         with caplog.at_level(logging.DEBUG, logger="test_task_watcher"):
-            task_watcher.watch(task, "OrphanedWiretap")
+            task_watcher.watch(task=task, name="OrphanedWiretap")
             task.cancel()
             
             try:
@@ -94,7 +94,7 @@ class TestTaskWatcher:
         task = asyncio.create_task(crashing_coroutine())
         
         with caplog.at_level(logging.ERROR, logger="test_task_watcher"):
-            task_watcher.watch(task, "WiretapParser")
+            task_watcher.watch(task=task, name="WiretapParser")
             
             try:
                 await task
@@ -123,7 +123,7 @@ class TestTaskWatcher:
         tasks = []
         for i in range(1000):
             t = asyncio.create_task(micro_task(i))
-            task_watcher.watch(t, f"SpikeTask_{i}")
+            task_watcher.watch(task=t, name=f"SpikeTask_{i}")
             tasks.append(t)
 
         with caplog.at_level(logging.ERROR, logger="test_task_watcher"):
@@ -155,7 +155,7 @@ class TestTaskWatcher:
         task = asyncio.create_task(wrapped_task())
         
         with caplog.at_level(logging.ERROR, logger="test_task_watcher"):
-            task_watcher.watch(task, "TargetLLM_Request")
+            task_watcher.watch(task=task, name="TargetLLM_Request")
             
             try:
                 await task
@@ -185,7 +185,7 @@ class TestTaskWatcher:
         # Spawn 50 UI background listeners
         active_tasks = [asyncio.create_task(worker_loop()) for _ in range(50)]
         for i, t in enumerate(active_tasks):
-            task_watcher.watch(t, f"Listener_{i}")
+            task_watcher.watch(task=t, name=f"Listener_{i}")
 
         # Simulate Poison Pill Teardown
         with caplog.at_level(logging.DEBUG, logger="test_task_watcher"):

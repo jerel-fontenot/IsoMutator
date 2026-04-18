@@ -30,7 +30,7 @@ def mock_strategy():
 def judge(mock_queues, mock_strategy):
     eval_q, feed_q, log_q = mock_queues
     # We mock the SemanticJudge to avoid ONNX loading during tests
-    judge_instance = RedTeamJudge(eval_q, feed_q, log_q, mock_strategy)
+    judge_instance = RedTeamJudge(eval_queue=eval_q, feedback_queue=feed_q, log_queue=log_q, strategy=mock_strategy)
     judge_instance.logger = MagicMock()
     judge_instance.semantic_judge = MagicMock()
     return judge_instance
@@ -47,13 +47,13 @@ async def test_judge_successful_attack_broadcasts_ledger(judge, mock_queues, moc
     mock_strategy.score_response.return_value = True
     
     # Run the internal evaluation logic directly
-    await judge._evaluate_batch([packet])
+    await judge._evaluate_batch(batch=[packet])
     
     # Verify the Judge bypassed the logger and broadcasted directly to Redis
     eval_q.broadcast_telemetry.assert_called_once()
-    call_args = eval_q.broadcast_telemetry.call_args[0]
-    assert call_args[0] == "ledger"
-    assert call_args[1]["packet_id"] == packet.id
+    call_kwargs = eval_q.broadcast_telemetry.call_args.kwargs
+    assert call_kwargs["event_type"] == "ledger"
+    assert call_kwargs["data"]["packet_id"] == packet.id
 
 @pytest.mark.asyncio
 async def test_judge_failed_attack_broadcasts_wiretap(judge, mock_queues, mock_strategy):
@@ -71,11 +71,11 @@ async def test_judge_failed_attack_broadcasts_wiretap(judge, mock_queues, mock_s
     
     # 1. Verify Wiretap Broadcast
     eval_q.broadcast_telemetry.assert_called_once()
-    assert eval_q.broadcast_telemetry.call_args[0][0] == "wiretap"
-    
+    assert eval_q.broadcast_telemetry.call_args.kwargs["event_type"] == "wiretap"
+
     # 2. Verify Routing to Feedback Queue (for next turn)
     feed_q.async_put.assert_called_once()
-    routed_packet = feed_q.async_put.call_args[0][0]
+    routed_packet = feed_q.async_put.call_args.kwargs["item"]
     assert routed_packet.turn_count == 2
 
 @pytest.mark.asyncio

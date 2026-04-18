@@ -6,27 +6,17 @@ to polymorphically handle different LLM API schemas (Ollama vs. OpenAI-compatibl
 2. Both clients implement `AttackerClientInterface` to ensure a standard `generate_json` contract.
 3. Both clients perform regex-based markdown stripping to recover poorly formatted JSON.
 4. Both clients implement an autonomous feedback loop, catching `JSONDecodeError` 
-   exceptions and passing them back to the LLM for self-correction.
+    exceptions and passing them back to the LLM for self-correction.
 """
 
 import abc
 import asyncio
 import aiohttp
 import json
-import logging
 import re
 
-# Establish TRACE level logging if it does not exist
-TRACE_LEVEL_NUM = 5
-if not hasattr(logging, "TRACE"):
-    logging.addLevelName(TRACE_LEVEL_NUM, "TRACE")
-    logging.TRACE = TRACE_LEVEL_NUM
-
-def trace(self, message, *args, **kws):
-    if self.isEnabledFor(TRACE_LEVEL_NUM):
-        self._log(TRACE_LEVEL_NUM, message, args, **kws)
-
-logging.Logger.trace = trace
+from isomutator.core.config import settings
+from isomutator.core.log_manager import LogManager
 
 
 class AttackerClientInterface(abc.ABC):
@@ -35,7 +25,7 @@ class AttackerClientInterface(abc.ABC):
     def __init__(self, url: str, model: str):
         self.url = url
         self.model = model
-        self.logger = logging.getLogger("isomutator.llm_client")
+        self.logger = LogManager.get_logger("isomutator.llm_client")
         
     @abc.abstractmethod
     async def generate_json(self, session: aiohttp.ClientSession, messages: list, max_retries: int = 3) -> dict:
@@ -66,18 +56,29 @@ class OllamaClient(AttackerClientInterface):
     async def generate_json(self, session: aiohttp.ClientSession, messages: list, max_retries: int = 3) -> dict:
         current_messages = messages.copy()
         
+        # Small models like Llama 3.2 often ignore the format flag without explicit instructions.
+        if not any(m.get("role") == "system" for m in current_messages):
+            current_messages.insert(0, {
+                "role": "system",
+                "content": "You are a strict data-generation API. You must output ONLY valid, raw JSON. Do not include markdown formatting, conversational filler, or trailing commas."
+            })
+        
         for attempt in range(max_retries):
-            # Strict Ollama Schema
+            # Strict Ollama Schema with strict token formatting
             payload = {
                 "model": self.model,
                 "format": "json",
                 "messages": current_messages,
-                "stream": False
+                "stream": False,
+                "options": {
+                    "temperature": 0.1  # Reduce hallucination variations
+                }
             }
 
             try:
                 self.logger.trace(f"Dispatching Ollama JSON request (Attempt {attempt + 1}/{max_retries})...")
-                async with session.post(self.url, json=payload, timeout=300.0) as response:
+                # --- THE FIX: Dynamic configuration timeout ---
+                async with session.post(self.url, json=payload, timeout=aiohttp.ClientTimeout(total=settings.network_timeout)) as response:
                     if response.status == 422:
                         self.logger.error("HTTP 422 Unprocessable Entity. Schema mismatch from Ollama Target.")
                         return {}
@@ -102,9 +103,12 @@ class OllamaClient(AttackerClientInterface):
                         current_messages.append({
                             "role": "user", 
                             "content": f"Your previous response failed JSON parsing with error: {e}. "
-                                       f"Please output ONLY valid JSON. Remove trailing commas and ensure quotes are escaped."
+                                        f"Please output ONLY valid JSON. Remove trailing commas and ensure quotes are escaped."
                         })
                         
+            except asyncio.TimeoutError:
+                self.logger.warning(f"Ollama API request timed out after {settings.network_timeout}s.")
+                return {}
             except Exception as e:
                 self.logger.error(f"Network error during Ollama generation: {e}")
                 
@@ -116,25 +120,31 @@ class OpenAIClient(AttackerClientInterface):
     """Adapter for OpenAI-compatible /v1/chat/completions schemas (vLLM, TGI, etc)."""
     
     def __init__(self, url: str, model: str):
-        # Append specific OpenAI endpoint. Factory passes base URL.
         super().__init__(f"{url.rstrip('/')}/v1/chat/completions", model)
         self.logger.trace(f"OpenAIClient initialized. Targeting: {self.url} (Model: {self.model})")
 
     async def generate_json(self, session: aiohttp.ClientSession, messages: list, max_retries: int = 3) -> dict:
         current_messages = messages.copy()
         
+        if not any(m.get("role") == "system" for m in current_messages):
+            current_messages.insert(0, {
+                "role": "system",
+                "content": "You are a strict data-generation API. You must output ONLY valid, raw JSON."
+            })
+        
         for attempt in range(max_retries):
-            # Strict OpenAI Schema (Omit "format" key)
+            # Strict OpenAI Schema utilizing native json_object enforcement
             payload = {
                 "model": self.model,
                 "messages": current_messages,
-                "temperature": 0.7,
-                "stream": False
+                "temperature": 0.1,
+                "stream": False,
+                "response_format": {"type": "json_object"}
             }
 
             try:
                 self.logger.trace(f"Dispatching OpenAI-compatible request (Attempt {attempt + 1}/{max_retries})...")
-                async with session.post(self.url, json=payload, timeout=300.0) as response:
+                async with session.post(self.url, json=payload, timeout=aiohttp.ClientTimeout(total=settings.network_timeout)) as response:
                     if response.status == 422:
                         self.logger.error("HTTP 422 Unprocessable Entity. Schema mismatch from OpenAI-Compatible Target.")
                         return {}
@@ -163,9 +173,12 @@ class OpenAIClient(AttackerClientInterface):
                         current_messages.append({
                             "role": "user", 
                             "content": f"Your previous response failed JSON parsing with error: {e}. "
-                                       f"Please output ONLY valid JSON. Remove trailing commas and ensure quotes are escaped."
+                                        f"Please output ONLY valid JSON. Remove trailing commas and ensure quotes are escaped."
                         })
-                        
+            
+            except asyncio.TimeoutError:
+                self.logger.warning(f"OpenAI API request timed out after {settings.network_timeout}s.")
+                return {}            
             except Exception as e:
                 self.logger.error(f"Network error during OpenAI generation: {e}")
                 

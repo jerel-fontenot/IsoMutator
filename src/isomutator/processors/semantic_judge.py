@@ -19,22 +19,9 @@ TECHNOLOGY QUIRKS:
   to strictly avoid importing PyTorch into the OS process memory space.
 """
 
-import logging
 import numpy as np
 from isomutator.core.cache import ResponseCache
-
-# Establish TRACE level logging for algorithmic tracking
-TRACE_LEVEL_NUM = 5
-if not hasattr(logging, "TRACE"):
-    logging.addLevelName(TRACE_LEVEL_NUM, "TRACE")
-    logging.TRACE = TRACE_LEVEL_NUM
-
-def trace(self, message, *args, **kws):
-    """Allows logger.trace('message') calls across the codebase."""
-    if self.isEnabledFor(TRACE_LEVEL_NUM):
-        self._log(TRACE_LEVEL_NUM, message, args, **kws)
-
-logging.Logger.trace = trace
+from isomutator.core.log_manager import LogManager
 
 
 class SemanticJudge:
@@ -42,7 +29,7 @@ class SemanticJudge:
     Evaluates the intent of a Target AI's response using ONNX vector embeddings.
     """
     def __init__(self, threshold: float = 0.3):
-        self.logger = logging.getLogger("isomutator.semantic_judge")
+        self.logger = LogManager.get_logger("isomutator.semantic_judge")
         self.threshold = threshold
         self.model_loaded = False
         
@@ -93,9 +80,11 @@ class SemanticJudge:
         Tokenizes, executes inference, and performs pure-NumPy mean pooling.
         """
         # 1. Tokenize and request NumPy arrays directly
+        assert self.tokenizer is not None
         inputs = self.tokenizer(text, padding=True, truncation=True, return_tensors="np")
-        
+
         # 2. ONNX Inference
+        assert self.model is not None
         outputs = self.model(**inputs)
         last_hidden_state = outputs.last_hidden_state
         attention_mask = inputs["attention_mask"]

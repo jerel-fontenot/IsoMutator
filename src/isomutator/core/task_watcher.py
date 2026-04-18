@@ -54,7 +54,7 @@ class TaskWatcher:
         # Ensure TRACE level exists locally just in case it wasn't configured upstream
         self.TRACE_LEVEL = getattr(logging, 'TRACE', 5)
 
-    def watch(self, task: asyncio.Task, name: str) -> None:
+    def watch(self, *, task: asyncio.Task, name: str) -> None:
         """
         Attaches the observation callback to the given asyncio Task.
         
@@ -63,9 +63,9 @@ class TaskWatcher:
             name: A human-readable identifier for the task in the logs.
         """
         # We use a lambda closure to pass the task name into the callback
-        task.add_done_callback(lambda t: self._on_task_done(name, t))
+        task.add_done_callback(lambda t: self._on_task_done(name=name, task=t))
 
-    def _on_task_done(self, name: str, task: asyncio.Task) -> None:
+    def _on_task_done(self, *, name: str, task: asyncio.Task) -> None:
         """
         The strict callback executed exactly once when the task finishes.
         Evaluates the final state of the task safely.

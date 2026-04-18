@@ -8,13 +8,13 @@ dependencies = [
     "aiofiles>=25.1.0",
     "aiohttp>=3.13.3",
     "jinja2>=3.1.6",
+    "nicegui>=2.0.0",
     "onnx>=1.21.0",
     "onnxruntime>=1.24.4",
     "optimum[onnxruntime]>=2.1.0",
     "pandas>=3.0.2",
     "pydantic-settings>=2.13.1",
-    "pytest>=9.0.2",
-    "pytest-asyncio>=1.3.0",
+    "redis>=5.0.0",
     "rich>=14.3.3",
     "scikit-learn>=1.8.0",
     "sentence-transformers>=5.3.0",
@@ -23,15 +23,27 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.408",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
 ]
 
 [tool.pytest.ini_options]
-pythonpath = [
-    "src"
-]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
+addopts = "--strict-markers"
+markers = [
+    "integration: marks tests that cross real system boundaries (Redis, disk). Deselect with '-m not integration'.",
+    "e2e: marks full pipeline tests (real HTTP server + real Redis). Deselect with '-m not e2e'.",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.14"
+include = ["src"]
 
 [build-system]
 requires = ["hatchling"]

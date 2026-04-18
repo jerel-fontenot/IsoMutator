@@ -24,21 +24,22 @@ import logging.config
 import logging.handlers
 import multiprocessing
 from pathlib import Path
+from typing import cast
 
 # ==========================================
-# 1. The TRACE Injection
+# 1. The TRACE Level & IsoLogger
 # ==========================================
 TRACE_LEVEL_NUM = 5
-if not hasattr(logging, "TRACE"):
-    logging.addLevelName(TRACE_LEVEL_NUM, "TRACE")
-    logging.TRACE = TRACE_LEVEL_NUM
+logging.addLevelName(TRACE_LEVEL_NUM, "TRACE")
 
-def trace(self, message, *args, **kws):
-    """Allows logger.trace('message') calls across the codebase."""
-    if self.isEnabledFor(TRACE_LEVEL_NUM):
-        self._log(TRACE_LEVEL_NUM, message, args, **kws)
 
-logging.Logger.trace = trace
+class IsoLogger(logging.Logger):
+    def trace(self, message: str, *args: object) -> None:
+        if self.isEnabledFor(TRACE_LEVEL_NUM):
+            self._log(TRACE_LEVEL_NUM, message, args)
+
+
+logging.setLoggerClass(IsoLogger)
 
 # ==========================================
 # 2. UI Telemetry Router
@@ -94,12 +95,14 @@ class LogManager:
             return
 
         # Ensure the logs directory exists before dictConfig tries to use it
+        # (also handled by IsoConfig.create_directories, but kept here for process-safety)
         Path("logs").mkdir(parents=True, exist_ok=True)
 
         self.log_queue = multiprocessing.Queue()
         self.listener = None
+        self._running = False
         self.ui_handler = UIDispatchHandler()
-        
+
         self._setup_from_config(config_path)
         self._initialized = True
 
@@ -108,7 +111,7 @@ class LogManager:
         Includes a graceful fallback if the JSON file is missing or corrupted.
         """
         root_logger = logging.getLogger()
-        physical_handlers = []
+        physical_handlers: list[logging.Handler] = []
 
         try:
             with open(config_path, 'r') as f:
@@ -116,10 +119,10 @@ class LogManager:
 
             # 1. Apply the configuration
             logging.config.dictConfig(config_dict)
-            
+
             # 2. Extract the physical handlers dictConfig just created
-            physical_handlers = root_logger.handlers.copy()
-            
+            physical_handlers = list(root_logger.handlers)
+
         except Exception as e:
             # --- FALLBACK MECHANISM ---
             # If the JSON is missing or malformed, default to a safe StreamHandler
@@ -150,19 +153,21 @@ class LogManager:
     def attach_dashboard(self, dashboard):
         """Links the UI Dispatcher to the live DashboardManager."""
         self.ui_handler.attach_dashboard(dashboard)
-        logging.getLogger("isomutator.system").trace("DashboardManager successfully attached to UI Dispatcher.")
+        LogManager.get_logger("isomutator.system").trace("DashboardManager successfully attached to UI Dispatcher.")
 
     def start(self):
         """Starts the background thread that writes logs to disk."""
-        if self.listener:
+        if self.listener and not self._running:
             self.listener.start()
-            logging.getLogger("isomutator.system").trace("LogManager QueueListener started.")
+            self._running = True
+            LogManager.get_logger("isomutator.system").trace("LogManager QueueListener started.")
 
     def stop(self):
         """Flushes the queue and stops the background thread safely."""
-        if self.listener:
-            logging.getLogger("isomutator.system").trace("LogManager QueueListener stopping...")
+        if self.listener and self._running:
+            LogManager.get_logger("isomutator.system").trace("LogManager QueueListener stopping...")
             self.listener.stop()
+            self._running = False
 
     @staticmethod
     def setup_worker(log_queue: multiprocessing.Queue, level: int = TRACE_LEVEL_NUM):
@@ -175,9 +180,9 @@ class LogManager:
 
         queue_handler = logging.handlers.QueueHandler(log_queue)
         root_logger.addHandler(queue_handler)
-        
-        logging.getLogger("isomutator.worker").trace("Worker logger attached to shared queue.")
+
+        LogManager.get_logger("isomutator.worker").trace("Worker logger attached to shared queue.")
 
     @staticmethod
-    def get_logger(name: str) -> logging.Logger:
-        return logging.getLogger(name)
+    def get_logger(name: str) -> IsoLogger:
+        return cast(IsoLogger, logging.getLogger(name))

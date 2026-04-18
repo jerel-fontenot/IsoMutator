@@ -13,7 +13,10 @@ TECHNOLOGY QUIRKS:
 - Connection Pooling (aiohttp): Instantiates a single `aiohttp.ClientSession()` that stays 
   open for the life of the worker, drastically reducing network overhead.
 - Sequential CPU Optimization: Bypasses `asyncio.gather` concurrency by restricting 
-  the batch size to 1, preventing CPU context-switching thrashing for SLMs.
+  the batch size to 1 using `get_batch(target_size=1)`, preventing CPU context-switching 
+  thrashing for SLMs.
+- Out-of-Band (OOB) Kill Switch: Checks a multiprocessing.Event on every loop iteration 
+  to instantly abandon network requests and tear down safely during UI interrupts.
 - aiofiles: Offloads physical disk reads of staged payloads to a background thread.
 """
 
@@ -22,127 +25,140 @@ import asyncio
 import aiohttp
 import aiofiles
 import multiprocessing
-import signal
+import multiprocessing.synchronize
 
 from isomutator.core.queue_manager import QueueManager
 from isomutator.core.log_manager import LogManager
 from isomutator.core.config import settings
 from isomutator.models.packet import DataPacket
 
+
 class AsyncStriker(multiprocessing.Process):
     """
-    Isolated OS Process that runs an asynchronous event loop to fire 
-    sequential network attacks against a target API.
+    Isolated OS Process that runs an asynchronous event loop to handle outbound HTTP strikes.
     """
-    def __init__(self, attack_queue: QueueManager, eval_queue: QueueManager, log_queue: multiprocessing.Queue, target_url: str):
-        super().__init__(name="Worker-Striker")
+    def __init__(self, *, attack_queue: QueueManager, eval_queue: QueueManager, log_queue, target_url: str, shutdown_event: multiprocessing.synchronize.Event | None = None):
+        super().__init__(name="AsyncStriker")
+        # Store parent references (these will be safely overwritten in the local memory space during run)
         self.attack_queue = attack_queue
         self.eval_queue = eval_queue
         self.log_queue = log_queue
-        self.target_url = target_url.rstrip("/")
-        self.staging_dir = os.path.join("tmp", "isomutator_staging")
-        self.logger = None
+        self.target_url = target_url
+        
+        # Store the Out-of-Band Kill Switch
+        self.shutdown_event = shutdown_event
 
     def run(self):
-        """The entry point for the isolated OS process."""
-        # Shield this child process from Ctrl+C to enforce graceful teardown
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-
+        """Process entry point. Must force a new event loop for this memory space."""
         LogManager.setup_worker(self.log_queue)
         self.logger = LogManager.get_logger("isomutator.striker")
-        
+
+        attack_name = getattr(self.attack_queue, 'queue_name', 'attack')
+        eval_name = getattr(self.eval_queue, 'queue_name', 'eval')
+
         try:
-            asyncio.run(self._strike_loop())
-        except asyncio.CancelledError:
-            self.logger.trace("Async loop cancelled safely during shutdown.")
+            self.attack_queue = QueueManager(queue_name=attack_name)
+            self.eval_queue = QueueManager(queue_name=eval_name)
+            asyncio.run(self._run_with_cleanup())
+        except KeyboardInterrupt:
+            self.logger.info("Striker caught KeyboardInterrupt. Shutting down.")
+        except Exception as e:
+            self.logger.error(f"[CRITICAL] Striker {self.name} Crashed: {e}")
+        finally:
+            print(f"[SYSTEM] Striker {self.name} releasing resources...")
+            self.log_queue.cancel_join_thread()
+            self.log_queue.close()
+
+    async def _run_with_cleanup(self):
+        try:
+            await self._strike_loop()
+        finally:
+            await self.attack_queue.close()
+            await self.eval_queue.close()
 
     async def _strike_loop(self):
-        self.logger.info(f"Striker online. Cannons aimed at: {self.target_url}")
+        self.logger.trace("Entering _strike_loop algorithm.")
         
+        # Open the single ClientSession for the life of the worker
         async with aiohttp.ClientSession() as session:
-            while True:
-                # 1. Pull batch from the queue to ensure sequential CPU processing
-                batch = await self.attack_queue.get_batch(
-                    target_size=settings.batch_size, 
-                    max_wait=1.0
-                )
-                if not batch:
-                    continue
+            try:
+                while True:
+                    # 1. Out-of-Band Kill Switch Check
+                    if self.shutdown_event and self.shutdown_event.is_set():
+                        self.logger.info("OOB Kill Switch activated. Striker abandoning queue.")
+                        break
+
+                    # 2. Pull the next packet sequentially using the correct QueueManager method
+                    # Utilizing get_batch with target_size=1 prevents CPU thrashing and respects the queue contract.
+                    batch = await self.attack_queue.get_batch(target_size=1, max_wait=1.0)
                     
-                # 2. Emergency stop check
-                if any(p == "POISON_PILL" for p in batch):
-                    self.logger.info("Poison Pill swallowed. Shutting down cannons cleanly.")
-                    break
+                    if not batch:
+                        continue # Queue is empty, loop around to check the kill switch again
+                        
+                    packet = batch[0]
 
-                self.logger.trace("Firing payload sequentially...")
+                    if not packet or packet == "POISON_PILL":
+                        self.logger.info("Poison Pill received. Striker shutting down.")
+                        break
 
-                # 3. Fire the payload and wait for the response
-                for packet in batch:
-                    updated_packet = await self._fire_payload(session, packet)
+                    self.logger.trace("Firing payload sequentially...")
+                    result_packet = await self._fire_payload(session=session, packet=packet)
 
-                    # 4. Forward the surviving packet to the AI Judge
-                    if updated_packet:
-                        await self.eval_queue.async_put(updated_packet)
+                    if result_packet:
+                        # 4. Offload to Evaluation Queue
+                        await self.eval_queue.async_put(item=result_packet)
                         self.logger.trace(f"Strike {packet.id[:8]} completed and forwarded to Judge.")
+                    
+            except asyncio.CancelledError:
+                self.logger.info("Striker loop cancelled by orchestrator.")
+                raise
 
-    async def _fire_payload(self, session: aiohttp.ClientSession, packet: DataPacket) -> DataPacket | None:
+    async def _fire_payload(self, *, session: aiohttp.ClientSession, packet: DataPacket) -> DataPacket | None:
         """
-        Executes a single HTTP strike against the target API.
-        Handles both standard requests and Context Injection uploads.
+        Executes the network request. Evaluates if the packet requires Context Staging 
+        (file upload) or standard conversational interaction.
         """
         try:
-            self.logger.trace(f"Sending payload {packet.id[:8]} to {self.target_url}...")
-
-            # ==========================================
-            # STAGE 1: Context Injection (If Required)
-            # ==========================================
-            # Safely check if the packet requires file staging (defaults to False)
-            requires_staging = getattr(packet, 'requires_staging', False)
+            chat_url = f"{self.target_url.rstrip('/')}/api/chat"
             
-            if requires_staging:
-                staged_filename = getattr(packet, 'staged_filename', None)
-                self.logger.trace(f"Payload {packet.id[:8]} requires staging. Initiating Upload for {staged_filename}.")
+            # --- Dual-Stage Evaluation (Context Injection) ---
+            # Only require the filename, as the file is read directly from disk
+            if getattr(packet, 'staged_filename', None):
+                upload_url = f"{self.target_url.rstrip('/')}/api/upload"
+                self.logger.trace(f"Dual-Stage execution required for packet {packet.id[:8]}. Uploading file...")
                 
-                if not staged_filename:
-                    self.logger.error("Packet requires staging but no filename was provided.")
+                filepath = str(settings.staging_dir / packet.staged_filename)
+                
+                # Respect the file system verification contract
+                if not os.path.exists(filepath):
+                    self.logger.error(f"Staged file {filepath} went missing before upload.")
+                    return None
+                
+                try:
+                    async with aiofiles.open(filepath, mode='rb') as f:
+                        file_data = await f.read()
+                except FileNotFoundError:
+                    self.logger.error(f"Staged file {filepath} went missing before upload.")
                     return None
                     
-                filepath = os.path.join(self.staging_dir, staged_filename)
-                
-                if not os.path.exists(filepath):
-                    self.logger.error(f"Error: Staged payload file not found at {filepath}")
-                    return None
-
-                async with aiofiles.open(filepath, 'rb') as f:
-                    file_data = await f.read()
-
                 form_data = aiohttp.FormData()
-                form_data.add_field(
-                    'file', 
-                    file_data, 
-                    filename=staged_filename, 
-                    content_type='text/plain'
-                )
+                form_data.add_field('file', file_data, filename=packet.staged_filename, content_type='text/plain')
                 
-                upload_url = f"{self.target_url}/upload"
-                async with session.post(upload_url, data=form_data, timeout=settings.network_timeout) as upload_resp:
-                    if upload_resp.status != 200:
-                        self.logger.error(f"Stage 1 Upload failed. Target returned HTTP {upload_resp.status}")
+                async with session.post(upload_url, data=form_data, timeout=aiohttp.ClientTimeout(total=settings.network_timeout)) as upload_res:
+                    if upload_res.status != 200:
+                        self.logger.error(f"File upload rejected by target for {packet.id[:8]}: HTTP {upload_res.status}")
                         return None
-                        
-                self.logger.trace(f"Stage 1 complete. File {staged_filename} ingested by target.")
+                    self.logger.trace("File upload successful. Proceeding to trigger phase.")
 
-            # ==========================================
-            # STAGE 2: Conversational Trigger
-            # ==========================================
-            chat_url = f"{self.target_url}/api/chat"
+            # --- Primary Inference Strike ---
+            self.logger.trace(f"Sending payload {packet.id[:8]} to {chat_url}...")
             
-            # Use the new API contract: {"query": "prompt text"}
+            # Formatting to standard CorpRAG Target schema: {"query": "prompt text"}
             payload = {
                 "query": packet.raw_content
             }
             
-            async with session.post(chat_url, json=payload, timeout=settings.network_timeout) as response:
+            async with session.post(chat_url, json=payload, timeout=aiohttp.ClientTimeout(total=settings.network_timeout)) as response:
                 if response.status != 200:
                     error_text = await response.text()
                     self.logger.error(f"Target server rejected strike {packet.id[:8]}: {response.status} - {error_text}")

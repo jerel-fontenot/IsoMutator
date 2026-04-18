@@ -75,7 +75,7 @@ def test_config_invalid_url_fails_fast():
 # --- 4. Tuning Sliders Tests ---
 def test_config_default_tuning_sliders():
     logger.log(logging.TRACE, "Testing default tuning slider values.")
-    config = IsoConfig()
+    config = IsoConfig(_env_file=None)
     
     # These must exist to prevent the Mutator/Striker from throwing AttributeErrors
     assert config.ping_pong_delay == 2.0

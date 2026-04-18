@@ -11,31 +11,20 @@ TECHNOLOGY QUIRKS:
   just results in a cache miss, never a pipeline crash.
 """
 
-import logging
 import sqlite3
 import hashlib
 
-# Establish TRACE level logging for algorithmic tracking
-TRACE_LEVEL_NUM = 5
-if not hasattr(logging, "TRACE"):
-    logging.addLevelName(TRACE_LEVEL_NUM, "TRACE")
-    logging.TRACE = TRACE_LEVEL_NUM
-
-def trace(self, message, *args, **kws):
-    """Allows logger.trace('message') calls across the codebase."""
-    if self.isEnabledFor(TRACE_LEVEL_NUM):
-        self._log(TRACE_LEVEL_NUM, message, args, **kws)
-
-logging.Logger.trace = trace
+from isomutator.core.log_manager import LogManager
+from isomutator.core.config import settings
 
 
 class ResponseCache:
     """
     A high-speed, multi-process safe cache for AI evaluation results.
     """
-    def __init__(self, db_path: str = "isomutator_cache.db"):
-        self.logger = logging.getLogger("isomutator.cache")
-        self.db_path = db_path
+    def __init__(self, db_path: str | None = None):
+        self.logger = LogManager.get_logger("isomutator.cache")
+        self.db_path = db_path or str(settings.cache_db)
         # timeout=5.0 allows processes to wait briefly if the DB is actively writing
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=5.0)
         self._initialize_db()

@@ -35,7 +35,7 @@ async def report_generator():
     # Inject a mock strategy for testing
     mock_strategy = MagicMock()
     mock_strategy.generate.return_value = "MOCK_REPORT_OUTPUT"
-    generator.register_strategy("mock_json", mock_strategy)
+    generator.register_strategy(name="mock_json", strategy=mock_strategy)
     
     yield generator
 
@@ -63,7 +63,7 @@ class TestReportGenerator:
         ]
         mock_aiofiles.return_value.__aenter__.return_value = create_mock_aiofile(valid_jsonl)
         
-        report = await report_generator.generate_report("dummy_ledger.jsonl", "mock_json")
+        report = await report_generator.generate_report(ledger_filepath="dummy_ledger.jsonl", format_name="mock_json")
         
         # Verify file was opened
         mock_aiofiles.assert_called_once_with("dummy_ledger.jsonl", mode='r')
@@ -83,7 +83,7 @@ class TestReportGenerator:
     async def test_edge_case_empty_ledger(self, mock_aiofiles, report_generator):
         mock_aiofiles.return_value.__aenter__.return_value = create_mock_aiofile([])
         
-        report = await report_generator.generate_report("empty.jsonl", "mock_json")
+        report = await report_generator.generate_report(ledger_filepath="empty.jsonl", format_name="mock_json")
         
         metrics = report_generator.last_metrics
         assert metrics["total_attacks"] == 0
@@ -101,7 +101,7 @@ class TestReportGenerator:
         mock_aiofiles.return_value.__aenter__.return_value = create_mock_aiofile(mixed_jsonl)
         
         with caplog.at_level(logging.WARNING):
-            await report_generator.generate_report("mixed.jsonl", "mock_json")
+            await report_generator.generate_report(ledger_filepath="mixed.jsonl", format_name="mock_json")
         
         # Generator should skip the bad line but process the valid ones
         metrics = report_generator.last_metrics
@@ -114,7 +114,7 @@ class TestReportGenerator:
         mock_aiofiles.side_effect = FileNotFoundError("Ledger not found")
         
         with pytest.raises(ReportingError, match="Failed to locate ledger file"):
-            await report_generator.generate_report("ghost.jsonl", "mock_json")
+            await report_generator.generate_report(ledger_filepath="ghost.jsonl", format_name="mock_json")
 
     # Protocol 4: Concurrency & Race Conditions
     @patch("aiofiles.open")
@@ -123,8 +123,8 @@ class TestReportGenerator:
         gen1 = ReportGenerator()
         gen2 = ReportGenerator()
         
-        gen1.register_strategy("mock", MagicMock(return_value="R1"))
-        gen2.register_strategy("mock", MagicMock(return_value="R2"))
+        gen1.register_strategy(name="mock_json", strategy=MagicMock(return_value="R1"))
+        gen2.register_strategy(name="mock_json", strategy=MagicMock(return_value="R2"))
         
         mock_file1 = create_mock_aiofile(['{"strategy": "s1", "success": true}\n'])
         mock_file2 = create_mock_aiofile(['{"strategy": "s2", "success": false}\n' for _ in range(5)])
@@ -132,8 +132,8 @@ class TestReportGenerator:
         # AsyncMock returns the files in the order they are called
         mock_aiofiles.return_value.__aenter__.side_effect = [mock_file1, mock_file2]
         
-        task1 = gen1.generate_report("f1.jsonl", "mock")
-        task2 = gen2.generate_report("f2.jsonl", "mock")
+        task1 = gen1.generate_report(ledger_filepath="f1.jsonl", format_name="mock_json")
+        task2 = gen2.generate_report(ledger_filepath="f2.jsonl", format_name="mock_json")
         
         await asyncio.gather(task1, task2)
         
@@ -156,7 +156,7 @@ class TestReportGenerator:
         
         with caplog.at_level(logging.ERROR):
             with pytest.raises(ReportingError, match="Report generation timed out"):
-                await report_generator.generate_report("slow.jsonl", "mock_json")
+                await report_generator.generate_report(ledger_filepath="slow.jsonl", format_name="mock_json")
         
         assert "Timeout exceeded while parsing ledger" in caplog.text
 
@@ -169,7 +169,7 @@ class TestReportGenerator:
         mock_aiofiles.return_value.__aenter__.return_value = mock_file
         
         with pytest.raises(ReportingError):
-            await report_generator.generate_report("crash.jsonl", "mock_json")
+            await report_generator.generate_report(ledger_filepath="crash.jsonl", format_name="mock_json")
         
         # Ensure that despite the crash inside the loop, aiofiles context manager exited cleanly
         mock_aiofiles.return_value.__aexit__.assert_called_once()

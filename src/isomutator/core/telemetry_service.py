@@ -7,17 +7,12 @@ of the broker connection. If the broker is unreachable, it catches the network e
 logs the failure, and returns a safe fallback state to prevent UI event loop crashes.
 """
 
-import logging
 from redis.exceptions import ConnectionError
 
-# Ensure TRACE level is defined per project specifications
-if not hasattr(logging, 'TRACE'):
-    logging.TRACE = 5
-    logging.addLevelName(logging.TRACE, 'TRACE')
-
 from isomutator.core.queue_manager import QueueManager
+from isomutator.core.log_manager import LogManager
 
-logger = logging.getLogger(__name__)
+logger = LogManager.get_logger(__name__)
 
 class TelemetryService:
     """
@@ -42,7 +37,7 @@ class TelemetryService:
         Returns:
             dict: A mapping of telemetry data points to populate the UI dashboard.
         """
-        logger.log(logging.TRACE, "Entering get_dashboard_metrics algorithm.")
+        logger.trace("Entering get_dashboard_metrics algorithm.")
         
         # Define the baseline fallback state
         metrics = {
@@ -52,17 +47,17 @@ class TelemetryService:
         }
 
         try:
-            logger.log(logging.TRACE, "Pinging broker to verify connection health.")
+            logger.trace("Pinging broker to verify connection health.")
             is_online = await self._queue_manager.ping_broker()
             
             if is_online:
                 metrics["broker_status"] = "Online"
-                logger.debug("Broker state confirmed Online. Proceeding with depth polls.")
+                logger.trace("Broker state confirmed Online. Proceeding with depth polls.")
                 
-                logger.log(logging.TRACE, "Polling attack queue depth.")
+                logger.trace("Polling attack queue depth.")
                 metrics["attack_queue_depth"] = await self._queue_manager.get_queue_depth("attack")
                 
-                logger.log(logging.TRACE, "Polling feedback queue depth.")
+                logger.trace("Polling feedback queue depth.")
                 metrics["feedback_queue_depth"] = await self._queue_manager.get_queue_depth("feedback")
                 
         except ConnectionError as e:
@@ -70,5 +65,5 @@ class TelemetryService:
             logger.error(f"Failed to fetch telemetry metrics: Redis is unreachable. {e}")
             metrics["broker_status"] = "Offline"
             
-        logger.log(logging.TRACE, f"Exiting get_dashboard_metrics with payload: {metrics}")
+        logger.trace(f"Exiting get_dashboard_metrics with payload: {metrics}")
         return metrics

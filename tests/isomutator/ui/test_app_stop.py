@@ -38,7 +38,7 @@ def dashboard_ui():
         
         # We also mock the control queue where the Poison Pill is sent
         dash.control_queue = MagicMock()
-        dash.control_queue.publish = AsyncMock()
+        dash.control_queue.broadcast_telemetry = AsyncMock()
         
         return dash
 
@@ -63,7 +63,7 @@ class TestCommandDashboardStopSequence:
         await dashboard_ui.action_stop_wargame()
 
         # Assert: Teardown Sequence
-        dashboard_ui.control_queue.publish.assert_called_once_with("wargame:control", {"command": "STOP"})
+        dashboard_ui.control_queue.broadcast_telemetry.assert_called_once_with(event_type="system", data={"command": "STOP"})
         mock_telemetry_task.cancel.assert_called_once()
         mock_worker.join.assert_called_once_with(timeout=3.0)
         
@@ -133,7 +133,7 @@ class TestCommandDashboardStopSequence:
         import logging
         
         # Arrange
-        dashboard_ui.control_queue.publish.side_effect = ConnectionError("Redis is unreachable")
+        dashboard_ui.control_queue.broadcast_telemetry.side_effect = ConnectionError("Redis is unreachable")
         mock_worker = MagicMock()
         dashboard_ui.workers = [mock_worker]
 
